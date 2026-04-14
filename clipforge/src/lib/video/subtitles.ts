@@ -1,4 +1,4 @@
-import type { CaptionOperation } from "@/types/edl";
+import type { CaptionOperation, HookOperation } from "@/types/edl";
 
 interface Word {
   word: string;
@@ -220,24 +220,98 @@ export function adjustTimeline(
 }
 
 /**
+ * Build the style + dialogue lines for a top-pinned hook banner
+ * (TikTok-style "Stop wasting tokens" header).
+ *
+ * Returns { styleLine, dialogueLines } so the caller can stitch them into
+ * the [V4+ Styles] and [Events] sections of the ASS file.
+ */
+function buildHookStyleAndDialogue(
+  hook: HookOperation,
+  outputDurationSec: number
+): { styleLine: string; dialogueLines: string[] } {
+  const text = (hook.text || "").trim();
+  if (!text || outputDurationSec <= 0) {
+    return { styleLine: "", dialogueLines: [] };
+  }
+
+  // Typography: bold sans, tight uppercase for "outline", natural case for "highlight"
+  const displayText =
+    hook.style === "highlight" ? text : text.toUpperCase();
+
+  // Colors
+  // outline variant: yellow fill + thick black stroke (no bg)
+  // highlight variant: yellow box bg + black text
+  const primary = hook.style === "highlight"
+    ? hexToAssColor("#1A1A1A")
+    : hexToAssColor("#FFEB3B");
+  const outline = hook.style === "highlight"
+    ? hexToAssColor("#1A1A1A") // no-op, box mode ignores outline
+    : hexToAssColor("#000000");
+  const back = hook.style === "highlight"
+    ? hexToAssColor("#FFEB3B")
+    : hexToAssColor("#00000000");
+
+  // Border style: 1 = outline+shadow, 3 = opaque box
+  const borderStyle = hook.style === "highlight" ? 3 : 1;
+  const outlineWidth = hook.style === "highlight" ? 0 : 6;
+  const shadow = hook.style === "highlight" ? 0 : 2;
+
+  // Alignment 8 = top-center, MarginV = distance from top in pixels at 1080x1920
+  const alignment = 8;
+  const marginV = 150;
+
+  const styleLine =
+    `Style: Hook,Arial Black,72,${primary},${primary},${outline},${back},-1,0,0,0,100,100,2,0,${borderStyle},${outlineWidth},${shadow},${alignment},40,40,${marginV},1`;
+
+  // Gentle pop-in: slight scale up then settle, plus fade in.
+  const startTag = `{\\fad(250,0)\\fscx105\\fscy105\\t(0,200,\\fscx100\\fscy100)}`;
+  const dialogueLine =
+    `Dialogue: 0,${assTime(0)},${assTime(outputDurationSec)},Hook,,0,0,0,,${startTag}${displayText}`;
+
+  return {
+    styleLine,
+    dialogueLines: [dialogueLine],
+  };
+}
+
+/**
  * Generate a polished ASS subtitle file.
  *
  * Caption position at ~3/4 screen height (not the very bottom).
  * Bold font, thick outline, drop shadow, readable on any background.
  * Karaoke mode highlights each word as it's spoken.
  *
+ * Optionally includes a top-pinned hook banner (HookOperation) spanning the full
+ * output duration. Hook uses its own "Hook" style in the ASS file, so captions
+ * and hook coexist without interfering.
+ *
+ * Returns null if there's nothing to render (no caption + no hook).
+ *
+ * @param words - word-level timestamps from Whisper
+ * @param caption - optional caption op; if null, no per-word subtitles are rendered
  * @param timeOffset - subtract from timestamps (for trim alignment)
  * @param trimEnd - only include words before this original time
+ * @param hook - optional hook banner
+ * @param outputDuration - full output duration in seconds (needed for hook timing)
  */
 export function generateSubtitles(
   words: Word[],
-  style: CaptionOperation,
+  caption: CaptionOperation | null,
   timeOffset: number = 0,
-  trimEnd?: number
-): string {
-  // Filter and shift words to the trim window
+  trimEnd?: number,
+  hook?: HookOperation,
+  outputDuration?: number
+): string | null {
+  const hasCaption = !!caption;
+  const hasHook =
+    !!hook && !!hook.text?.trim() && (outputDuration ?? 0) > 0;
+
+  if (!hasCaption && !hasHook) return null;
+
+  // Filter and shift words to the trim window (only matters for captions)
   let filteredWords = words;
-  if (timeOffset > 0 || trimEnd !== undefined) {
+  if (hasCaption && (timeOffset > 0 || trimEnd !== undefined)) {
     filteredWords = words
       .filter((w) => {
         if (w.end <= timeOffset) return false;
@@ -251,78 +325,93 @@ export function generateSubtitles(
       }));
   }
 
-  const chunks = groupWords(filteredWords);
+  // Build caption style if present
+  const styleLines: string[] = [];
+  const dialogueLines: string[] = [];
 
-  const fontSize = resolveFontSize(style.fontSize || "large");
-  const position = resolvePosition(style.position || "bottom-center");
-  const primaryColor = hexToAssColor(style.fontColor || "#FFFFFF");
-  const isKaraoke = (style.style || "").includes("karaoke");
-  const isWordByWord = (style.style || "").includes("word");
+  if (hasCaption && caption) {
+    const chunks = groupWords(filteredWords);
 
-  // Highlight color for karaoke (spoken word color)
-  // Use a vibrant accent: yellow by default, or derive from fontColor
-  const highlightColor = "&H00FFFF&"; // Yellow in BGR
+    const fontSize = resolveFontSize(caption.fontSize || "large");
+    const position = resolvePosition(caption.position || "bottom-center");
+    const primaryColor = hexToAssColor(caption.fontColor || "#FFFFFF");
+    const isKaraoke = (caption.style || "").includes("karaoke");
+    const isWordByWord = (caption.style || "").includes("word");
 
-  // Secondary color is the karaoke highlight fill color
-  const secondaryColor = highlightColor;
+    const highlightColor = "&H00FFFF&"; // Yellow in BGR
+    const secondaryColor = highlightColor;
 
-  // Position: ASS uses MarginV from the alignment edge
-  // Alignment 2 = bottom-center. For 3/4 height on a 1920px tall video:
-  //   bottom margin = 1920 * 0.25 = 480px
-  // Alignment 8 = top-center, margin from top
-  // Alignment 5 = center, ignore margin
-  let alignment: number;
-  let marginV: number;
+    let alignment: number;
+    let marginV: number;
+    switch (position) {
+      case "top":
+        alignment = 8;
+        marginV = 200;
+        break;
+      case "center":
+        alignment = 5;
+        marginV = 0;
+        break;
+      case "bottom":
+      default:
+        alignment = 2;
+        marginV = 480;
+        break;
+    }
 
-  switch (position) {
-    case "top":
-      alignment = 8;
-      marginV = 200;
-      break;
-    case "center":
-      alignment = 5;
-      marginV = 0;
-      break;
-    case "bottom":
-    default:
-      // Position at ~3/4 from top = 1/4 from bottom = 480px margin from bottom
-      alignment = 2;
-      marginV = 480;
-      break;
+    const outline = caption.outlineWidth ?? 4;
+    const shadow = caption.shadowDepth ?? 2;
+
+    const hasBgColor =
+      caption.backgroundColor &&
+      caption.backgroundColor !== "" &&
+      caption.backgroundColor !== "#00000000";
+
+    let borderStyle: number;
+    if (caption.borderStyle === "none") {
+      borderStyle = 1;
+    } else if (caption.borderStyle === "box" || (hasBgColor && caption.borderStyle !== "outline")) {
+      borderStyle = 3;
+    } else {
+      borderStyle = 1;
+    }
+
+    const effectiveOutline = caption.borderStyle === "none" ? 0 : outline;
+    const bgColor = hasBgColor
+      ? hexToAssColor(caption.backgroundColor)
+      : "&H80000000&";
+    const outlineColor = hexToAssColor("#000000");
+
+    const styleName = "Default";
+    const fontName = caption.fontFamily || "Arial Black";
+    const isBold = (caption.fontWeight ?? "bold") === "bold";
+
+    styleLines.push(
+      `Style: ${styleName},${fontName},${fontSize},${primaryColor},${secondaryColor},${outlineColor},${bgColor},${isBold ? -1 : 0},0,0,0,100,100,1,0,${borderStyle},${effectiveOutline},${shadow},${alignment},40,40,${marginV},1`
+    );
+
+    for (const chunk of chunks) {
+      if (isKaraoke) {
+        dialogueLines.push(
+          buildKaraokeDialogue(chunk, styleName, highlightColor)
+        );
+      } else if (isWordByWord) {
+        dialogueLines.push(...buildWordByWordDialogue(chunk, styleName));
+      } else {
+        dialogueLines.push(buildStandardDialogue(chunk, styleName));
+      }
+    }
   }
 
-  // Use extended fields with defaults
-  const outline = style.outlineWidth ?? 4;
-  const shadow = style.shadowDepth ?? 2;
-
-  // Border style from the operation, or auto-detect from background
-  const hasBgColor =
-    style.backgroundColor &&
-    style.backgroundColor !== "" &&
-    style.backgroundColor !== "#00000000";
-
-  let borderStyle: number;
-  if (style.borderStyle === "none") {
-    borderStyle = 1; // outline mode but with 0 outline below
-  } else if (style.borderStyle === "box" || (hasBgColor && style.borderStyle !== "outline")) {
-    borderStyle = 3; // opaque box
-  } else {
-    borderStyle = 1; // outline + shadow
+  // Build hook style + dialogue if present
+  if (hasHook && hook && outputDuration) {
+    const { styleLine, dialogueLines: hookLines } = buildHookStyleAndDialogue(
+      hook,
+      outputDuration
+    );
+    if (styleLine) styleLines.push(styleLine);
+    dialogueLines.push(...hookLines);
   }
-
-  const effectiveOutline = style.borderStyle === "none" ? 0 : outline;
-
-  const bgColor = hasBgColor
-    ? hexToAssColor(style.backgroundColor)
-    : "&H80000000&";
-
-  const outlineColor = hexToAssColor("#000000");
-
-  const styleName = "Default";
-
-  // Font from extended fields
-  const fontName = style.fontFamily || "Arial Black";
-  const isBold = (style.fontWeight ?? "bold") === "bold";
 
   const header = [
     "[Script Info]",
@@ -334,26 +423,11 @@ export function generateSubtitles(
     "",
     "[V4+ Styles]",
     "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
-    `Style: ${styleName},${fontName},${fontSize},${primaryColor},${secondaryColor},${outlineColor},${bgColor},${isBold ? -1 : 0},0,0,0,100,100,1,0,${borderStyle},${effectiveOutline},${shadow},${alignment},40,40,${marginV},1`,
+    ...styleLines,
     "",
     "[Events]",
     "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
   ];
-
-  // Build dialogue lines
-  const dialogueLines: string[] = [];
-
-  for (const chunk of chunks) {
-    if (isKaraoke) {
-      dialogueLines.push(
-        buildKaraokeDialogue(chunk, styleName, highlightColor)
-      );
-    } else if (isWordByWord) {
-      dialogueLines.push(...buildWordByWordDialogue(chunk, styleName));
-    } else {
-      dialogueLines.push(buildStandardDialogue(chunk, styleName));
-    }
-  }
 
   return [...header, ...dialogueLines, ""].join("\n");
 }

@@ -145,7 +145,14 @@ export function buildFFmpegArgs(
   // Track which "global" op types we've already applied — the model sometimes
   // emits duplicate speed/caption/reframe/silence_remove ops, and stacking the
   // filters wrecks the timeline (e.g. setpts=0.8*PTS x12 yields zero frames).
-  const applied = { speed: false, caption: false, reframe: false, silence_remove: false };
+  const applied = {
+    speed: false,
+    caption: false,
+    reframe: false,
+    silence_remove: false,
+    subtitles: false, // shared: either caption OR hook adds the subtitles filter
+    hook: false,
+  };
 
   // Second pass: build filters
   for (let i = 0; i < edl.operations.length; i++) {
@@ -190,15 +197,39 @@ export function buildFFmpegArgs(
           console.log(`[ffmpeg:build]   caption: SKIPPED (already applied)`);
           break;
         }
+        applied.caption = true;
         console.log(`[ffmpeg:build]   caption: subtitlePath=${subtitlePath ?? "NONE"}`);
-        if (subtitlePath) {
+        if (subtitlePath && !applied.subtitles) {
           const escapedPath = escapeFilterPath(subtitlePath);
           const filter = `subtitles=${escapedPath}`;
-          console.log(`[ffmpeg:build]   caption filter: ${filter}`);
+          console.log(`[ffmpeg:build]   subtitles filter: ${filter}`);
           videoFilters.push(filter);
-          applied.caption = true;
-        } else {
+          applied.subtitles = true;
+        } else if (!subtitlePath) {
           console.log(`[ffmpeg:build]   WARNING: caption op found but no subtitle file!`);
+        }
+        break;
+      }
+
+      case "hook": {
+        // The hook banner is rendered via the same ASS subtitle file as the
+        // caption (separate style block inside). The subtitle generator stitches
+        // both styles into one file. Here we just need to ensure the
+        // `subtitles=<path>` filter is applied once, even if there's no caption.
+        if (applied.hook) {
+          console.log(`[ffmpeg:build]   hook: SKIPPED (already applied)`);
+          break;
+        }
+        applied.hook = true;
+        console.log(`[ffmpeg:build]   hook: subtitlePath=${subtitlePath ?? "NONE"}`);
+        if (subtitlePath && !applied.subtitles) {
+          const escapedPath = escapeFilterPath(subtitlePath);
+          const filter = `subtitles=${escapedPath}`;
+          console.log(`[ffmpeg:build]   subtitles filter (from hook): ${filter}`);
+          videoFilters.push(filter);
+          applied.subtitles = true;
+        } else if (!subtitlePath) {
+          console.log(`[ffmpeg:build]   WARNING: hook op found but no subtitle file!`);
         }
         break;
       }
@@ -256,17 +287,25 @@ export function buildFFmpegArgs(
           }
         }
 
-        // Remove filler words
+        // Remove filler words.
         // NOTE: Filler words are short (0.2-0.5s). Do NOT apply padding to them,
         // or the padding eats the entire cut and nothing gets removed.
+        //
+        // POLICY: when removeFiller is true, cut EVERY detected filler. GPT's
+        // fillerWords list is treated as a HINT for which EXTRA words beyond
+        // our defaults to flag upstream in transcribe.detectFillerWords(), not
+        // as a whitelist applied here. Previously this was an intersect, which
+        // meant a narrow GPT list ("uh" only) kept "so", "right", "like" in
+        // the output. Users expect "remove fillers" to mean remove them all.
         if (silOp.removeFiller && meta?.fillerWordTimestamps) {
-          const targetFillers = silOp.fillerWords?.length > 0
-            ? meta.fillerWordTimestamps.filter((f) =>
-                silOp.fillerWords.some((w) => f.word.toLowerCase().includes(w.toLowerCase()))
-              )
-            : meta.fillerWordTimestamps;
+          const targetFillers = meta.fillerWordTimestamps;
 
-          console.log(`[ffmpeg:build]   silence_remove: ${targetFillers.length} filler words to remove`);
+          console.log(
+            `[ffmpeg:build]   silence_remove: ${targetFillers.length} filler words to remove` +
+              (silOp.fillerWords?.length
+                ? ` (GPT hinted: ${silOp.fillerWords.join(", ")})`
+                : "")
+          );
           for (const f of targetFillers) {
             // Use the exact word boundaries, no padding. The word itself IS the thing to cut.
             console.log(`[ffmpeg:build]     removing filler "${f.word}": ${f.start.toFixed(3)} - ${f.end.toFixed(3)}`);
@@ -404,7 +443,7 @@ export function buildFFmpegArgs(
   console.log(`[ffmpeg:build] Encoder: ${encoder.label}`);
 
   const encoderArgs = hasSelectFilter
-    ? ["-c:v", "libx264", "-preset", "fast", "-crf", "23"]
+    ? ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23"]
     : getEncoderArgs();
 
   args.push(
@@ -423,13 +462,21 @@ export function buildFFmpegArgs(
 }
 
 /**
- * Position map: convert position name to FFmpeg overlay coordinates.
- * Assumes 1080-wide video and 1024x1024 illustration scaled to fit.
+ * Get x:y overlay position expression for a given named slot.
+ * Uses FFmpeg's W/w/H/h runtime references so it adapts to actual dimensions.
  */
-function getOverlayPosition(position: string, videoWidth: number, videoHeight: number): string {
+function getOverlayPosition(
+  position: string,
+  animation: "none" | "fade" | "slide" | "kenburns",
+  startSec: number
+): string {
   const margin = 20;
-  const imgSize = Math.round(Math.min(videoWidth, videoHeight) * 0.3); // 30% of smaller dimension
 
+  // Slide-in duration for half-screen entrance
+  const SLIDE_DUR = 0.4;
+
+  // For half-screen positions with slide animation, x depends on time.
+  // Otherwise x is a constant FFmpeg expression.
   switch (position) {
     case "top-right":
       return `W-w-${margin}:${margin}`;
@@ -443,8 +490,47 @@ function getOverlayPosition(position: string, videoWidth: number, videoHeight: n
       return "(W-w)/2:(H-h)/2";
     case "fullscreen":
       return "0:0";
+    case "left-half": {
+      if (animation === "slide") {
+        // Slide in from the left edge over SLIDE_DUR seconds, then settle at x=0
+        return `x='if(lt(t-${startSec.toFixed(3)},${SLIDE_DUR}),-w+(t-${startSec.toFixed(3)})/${SLIDE_DUR}*w,0)':y=0`;
+      }
+      return `0:0`;
+    }
+    case "right-half": {
+      if (animation === "slide") {
+        // Slide in from the right edge over SLIDE_DUR seconds, then settle at x=W-w
+        return `x='if(lt(t-${startSec.toFixed(3)},${SLIDE_DUR}),W-(t-${startSec.toFixed(3)})/${SLIDE_DUR}*w,W-w)':y=0`;
+      }
+      return `W-w:0`;
+    }
     default:
       return `W-w-${margin}:${margin}`;
+  }
+}
+
+/**
+ * Pick the FFmpeg scale filter for the image based on the chosen position +
+ * the ACTUAL output video dimensions (post-reframe).
+ */
+function getOverlayScale(
+  position: string,
+  videoWidth: number,
+  videoHeight: number
+): string {
+  switch (position) {
+    case "fullscreen":
+      return `scale=${videoWidth}:${videoHeight}:force_original_aspect_ratio=increase,crop=${videoWidth}:${videoHeight}`;
+    case "left-half":
+    case "right-half":
+      // Half the width, full height, crop to fit exactly.
+      return `scale=${Math.round(videoWidth / 2)}:${videoHeight}:force_original_aspect_ratio=increase,crop=${Math.round(videoWidth / 2)}:${videoHeight}`;
+    case "center":
+      // Big centered card ~60% of smaller dimension
+      return `scale=${Math.round(Math.min(videoWidth, videoHeight) * 0.6)}:-1`;
+    default:
+      // Corner overlay ~30% of width
+      return `scale=${Math.round(videoWidth * 0.3)}:-1`;
   }
 }
 
@@ -454,11 +540,19 @@ interface IllustrationOverlay {
   endTime: number;
   position: string;
   opacity: number;
+  animation?: "none" | "fade" | "slide" | "kenburns";
 }
 
 /**
  * Build FFmpeg command to overlay illustrations on a video.
- * This runs as a SECOND pass after the main render, because overlays need filter_complex.
+ * This runs as a SECOND pass after the main render.
+ *
+ * Each overlay is given a fade-in + fade-out by default (0.25s each side).
+ * Half-screen positions can additionally slide in from the outside edge.
+ * `kenburns` adds a slow zoom for fullscreen / half-screen moments.
+ *
+ * videoWidth/videoHeight MUST be the actual output dimensions (post-reframe),
+ * not the source dimensions. Half-screen math requires accurate pixels.
  */
 export function buildIllustrationOverlayArgs(
   inputVideoPath: string,
@@ -470,38 +564,66 @@ export function buildIllustrationOverlayArgs(
   if (illustrations.length === 0) return [];
 
   const args: string[] = ["-y", "-i", inputVideoPath];
-
-  // Add each illustration image as an input
   for (const illust of illustrations) {
     args.push("-i", illust.imagePath);
   }
 
-  // Build filter_complex chain
-  // Each overlay: scale image, set opacity, enable/disable by time, overlay on video
+  const FADE_DUR = 0.25; // seconds
   const filters: string[] = [];
   let currentStream = "0:v";
 
   for (let i = 0; i < illustrations.length; i++) {
     const illust = illustrations[i];
     const inputIdx = i + 1; // input 0 is the video, 1+ are images
-    const pos = getOverlayPosition(illust.position, videoWidth, videoHeight);
 
-    // Scale the illustration image
-    const scale = illust.position === "fullscreen"
-      ? `scale=${videoWidth}:${videoHeight}`
-      : `scale=${Math.round(videoWidth * 0.3)}:-1`;
+    const animation = illust.animation ?? "fade";
+    // Clamp fade duration so it never exceeds half the window
+    const windowDur = Math.max(0.5, illust.endTime - illust.startTime);
+    const fadeDur = Math.min(FADE_DUR, windowDur / 2 - 0.05);
 
-    // Apply opacity using colorchannelmixer
-    const alpha = illust.opacity.toFixed(2);
+    const fadeIn = `fade=t=in:st=${illust.startTime.toFixed(3)}:d=${fadeDur.toFixed(2)}:alpha=1`;
+    const fadeOut = `fade=t=out:st=${(illust.endTime - fadeDur).toFixed(3)}:d=${fadeDur.toFixed(2)}:alpha=1`;
 
-    // Enable overlay only during the time window
-    const enable = `between(t,${illust.startTime.toFixed(3)},${illust.endTime.toFixed(3)})`;
+    const scale = getOverlayScale(illust.position, videoWidth, videoHeight);
+    const position = getOverlayPosition(illust.position, animation, illust.startTime);
+    const opacity = illust.opacity.toFixed(2);
+
+    // Ken Burns: slow 1.0x → 1.08x zoom across the window, for fullscreen/half-screen.
+    // Applied via zoompan on a single still frame (d=1) feeding the scale.
+    const wantsKenburns =
+      animation === "kenburns" &&
+      (illust.position === "fullscreen" ||
+        illust.position === "left-half" ||
+        illust.position === "right-half");
+
+    const imageChain: string[] = [];
+    imageChain.push(scale);
+    imageChain.push("format=rgba");
+    if (wantsKenburns) {
+      // Progress 0→1 over the visible window
+      const zsteps = Math.round(windowDur * 30); // 30 fps effective
+      imageChain.push(
+        `zoompan=z='min(zoom+0.0012,1.08)':d=${Math.max(1, zsteps)}:s=${Math.round(videoWidth)}x${Math.round(videoHeight)}`
+      );
+    }
+    imageChain.push(fadeIn);
+    imageChain.push(fadeOut);
+    imageChain.push(`colorchannelmixer=aa=${opacity}`);
 
     const scaledLabel = `img${i}`;
     const outLabel = i < illustrations.length - 1 ? `v${i}` : "vout";
 
-    filters.push(`[${inputIdx}:v]${scale},format=rgba,colorchannelmixer=aa=${alpha}[${scaledLabel}]`);
-    filters.push(`[${currentStream}][${scaledLabel}]overlay=${pos}:enable='${enable}'[${outLabel}]`);
+    const enable = `between(t,${illust.startTime.toFixed(3)},${illust.endTime.toFixed(3)})`;
+
+    filters.push(`[${inputIdx}:v]${imageChain.join(",")}[${scaledLabel}]`);
+
+    // Half-screen slide uses explicit x='...':y=0 form; other positions use x:y shorthand.
+    const overlayExpr = position.startsWith("x='")
+      ? `${position}:enable='${enable}'`
+      : `${position}:enable='${enable}'`;
+    filters.push(
+      `[${currentStream}][${scaledLabel}]overlay=${overlayExpr}[${outLabel}]`
+    );
 
     currentStream = outLabel;
   }
@@ -517,7 +639,9 @@ export function buildIllustrationOverlayArgs(
     outputPath
   );
 
-  console.log(`[ffmpeg:illustrations] Built overlay command for ${illustrations.length} illustrations`);
+  console.log(
+    `[ffmpeg:illustrations] Built overlay command for ${illustrations.length} illustration(s) at ${videoWidth}x${videoHeight}`
+  );
 
   return args;
 }

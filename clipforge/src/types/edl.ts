@@ -20,7 +20,8 @@ export type EditOperation =
   | SilenceRemoveOperation
   | ReframeOperation
   | TransitionOperation
-  | IllustrationOperation;
+  | IllustrationOperation
+  | HookOperation;
 
 export interface TrimOperation {
   type: "trim";
@@ -92,9 +93,35 @@ export interface IllustrationOperation {
   illustrations: Array<{
     startTime: number;
     endTime: number;
-    prompt: string; // DALL-E prompt describing what to generate
+    prompt: string; // Nano Banana prompt describing what to generate
     context: string; // transcript text that motivated this illustration
-    position: "fullscreen" | "top-right" | "top-left" | "bottom-right" | "bottom-left" | "center";
-    opacity: number; // 0-1, how transparent the overlay is
+    position:
+      | "fullscreen"
+      | "top-right"
+      | "top-left"
+      | "bottom-right"
+      | "bottom-left"
+      | "center"
+      // Split-screen: image fills one half of the video while the speaker
+      // stays on the other half. Great for product shots or references while
+      // the presenter talks.
+      | "left-half"
+      | "right-half";
+    opacity: number; // 0-1, peak opacity at the middle of the overlay window
+    // Optional animation. All overlays get a 0.25s fade in + out by default.
+    // `kenburns` adds a slow zoom for fullscreen/half-screen moments.
+    // `slide` comes in from the outside edge (half-screen only).
+    animation?: "none" | "fade" | "slide" | "kenburns";
   }>;
+}
+
+/**
+ * Hook banner — 3-6 word topic/hook pinned to the top of the video for the full
+ * output duration. Like the "Stop wasting tokens" header in TikTok talking-head
+ * edits. Rendered via the same ASS subtitle pipeline as captions.
+ */
+export interface HookOperation {
+  type: "hook";
+  text: string; // 3-6 words. Use sentence case; renderer uppercases for "outline" style.
+  style: "outline" | "highlight"; // outline: yellow fill + black stroke; highlight: yellow box, black text
 }

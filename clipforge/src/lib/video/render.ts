@@ -17,7 +17,43 @@ import type {
   CaptionOperation,
   TrimOperation,
   IllustrationOperation,
+  HookOperation,
+  ReframeOperation,
 } from "@/types/edl";
+
+/**
+ * Compute the ACTUAL output dimensions after applying the reframe op.
+ * Needed for the illustration overlay pass to place half-screen and fullscreen
+ * images correctly. Without this, half-screen on a reframed 1080×1920 video
+ * would use source 1920×1080 math and the image would be half as tall as
+ * intended, leaving a visible gap.
+ */
+function computeOutputDimensions(
+  edl: EditDecisionList,
+  disabled: Set<number>
+): { width: number; height: number } {
+  const reframe = edl.operations.find(
+    (op, i) => op.type === "reframe" && !disabled.has(i)
+  ) as ReframeOperation | undefined;
+
+  if (!reframe) {
+    return {
+      width: edl.sourceVideo.width,
+      height: edl.sourceVideo.height,
+    };
+  }
+
+  switch (reframe.targetAspectRatio) {
+    case "9:16":
+      return { width: 1080, height: 1920 };
+    case "1:1":
+      return { width: 1080, height: 1080 };
+    case "4:5":
+      return { width: 1080, height: 1350 };
+    default:
+      return { width: 1080, height: 1920 };
+  }
+}
 
 interface RenderJobData {
   projectId: string;
@@ -36,12 +72,57 @@ function runFFmpeg(
   onProgress: (percent: number) => void
 ): Promise<void> {
   return new Promise((resolve, reject) => {
-    console.log(`[ffmpeg:exec] Spawning: ffmpeg ${args.join(" ")}`);
-    const proc = spawn("ffmpeg", args, {
+    // Force FFmpeg to flush progress every 0.5s to a dedicated stdout channel
+    // in machine-readable key=value blocks. On Windows this fixes the classic
+    // "stuck at 0% then jump to 100%" issue caused by stderr carriage-return
+    // buffering. The -progress flag MUST come after input args; FFmpeg parses
+    // global options left-to-right, so we inject it right before the output.
+    const outputIdx = args.length - 1;
+    const fullArgs = [
+      ...args.slice(0, outputIdx),
+      "-stats_period", "0.5",
+      "-progress", "pipe:1",
+      args[outputIdx],
+    ];
+
+    console.log(`[ffmpeg:exec] Spawning: ffmpeg ${fullArgs.join(" ")}`);
+    const proc = spawn("ffmpeg", fullArgs, {
       stdio: ["pipe", "pipe", "pipe"],
     });
 
     let stderr = "";
+    let lastPercent = -1;
+
+    const handleTime = (currentTimeSeconds: number) => {
+      const percent = Math.min(
+        99,
+        Math.max(0, Math.round((currentTimeSeconds / totalDuration) * 100))
+      );
+      // Only emit when the integer percent actually changes — avoids SSE spam
+      if (percent !== lastPercent) {
+        lastPercent = percent;
+        onProgress(percent);
+      }
+    };
+
+    // -progress pipe:1 writes key=value blocks to stdout, e.g.
+    //   frame=42
+    //   fps=30.0
+    //   out_time_us=1400000
+    //   out_time=00:00:01.400000
+    //   progress=continue
+    proc.stdout?.on("data", (data: Buffer) => {
+      const chunk = data.toString();
+      const matches = chunk.matchAll(/out_time=(\d+):(\d+):(\d+(?:\.\d+)?)/g);
+      let last: number | null = null;
+      for (const m of matches) {
+        last =
+          parseInt(m[1], 10) * 3600 +
+          parseInt(m[2], 10) * 60 +
+          parseFloat(m[3]);
+      }
+      if (last !== null) handleTime(last);
+    });
 
     proc.stderr?.on("data", (data: Buffer) => {
       const line = data.toString();
@@ -52,18 +133,17 @@ function runFFmpeg(
         console.log(`[ffmpeg:stderr] ${line.trim()}`);
       }
 
-      const match = line.match(/time=(\d+):(\d+):(\d+\.?\d*)/);
-      if (match) {
-        const hours = parseInt(match[1], 10);
-        const minutes = parseInt(match[2], 10);
-        const seconds = parseFloat(match[3]);
-        const currentTime = hours * 3600 + minutes * 60 + seconds;
-        const percent = Math.min(
-          99,
-          Math.round((currentTime / totalDuration) * 100)
-        );
-        onProgress(percent);
+      // Fallback: parse time= from stderr too (matchAll to catch the LAST
+      // value in a carriage-return-concatenated chunk on Windows).
+      const matches = line.matchAll(/time=(\d+):(\d+):(\d+(?:\.\d+)?)/g);
+      let last: number | null = null;
+      for (const m of matches) {
+        last =
+          parseInt(m[1], 10) * 3600 +
+          parseInt(m[2], 10) * 60 +
+          parseFloat(m[3]);
       }
+      if (last !== null) handleTime(last);
     });
 
     proc.on("close", (code) => {
@@ -110,38 +190,129 @@ export async function renderVideo(data: RenderJobData): Promise<string> {
     }
   }
 
-  // 1. Generate subtitles if captions are in the EDL
+  // 1. Generate subtitles if captions OR a hook are in the EDL.
+  // Both ride on the same ASS file (separate styles inside).
   let subtitlePath: string | undefined;
 
   const captionOp = edl.operations.find(
     (op, i) => op.type === "caption" && !disabled.has(i)
   ) as CaptionOperation | undefined;
 
+  const hookOp = edl.operations.find(
+    (op, i) => op.type === "hook" && !disabled.has(i)
+  ) as HookOperation | undefined;
+
   console.log(`[render:pipeline] Caption operation found: ${!!captionOp}`);
+  console.log(`[render:pipeline] Hook operation found: ${!!hookOp}${hookOp ? ` — "${hookOp.text}"` : ""}`);
   console.log(`[render:pipeline] Words available: ${words?.length ?? 0}`);
 
-  if (captionOp && words && words.length > 0) {
+  // Output duration estimate (for hook banner full-span timing).
+  // Use EDL's explicit estimate, or fall back to the trimmed window.
+  const outputDurationForHook =
+    edl.estimatedOutputDuration && edl.estimatedOutputDuration > 0
+      ? edl.estimatedOutputDuration
+      : Math.max(0, trimEnd - trimStart);
+
+  const needsSubtitleFile =
+    (!!captionOp && !!words && words.length > 0) || !!hookOp;
+
+  if (needsSubtitleFile) {
     emitProgress(projectId, {
       stage: "rendering",
       progress: 5,
-      currentStep: "Generating subtitles...",
+      currentStep: captionOp && hookOp
+        ? "Generating subtitles and hook..."
+        : hookOp
+          ? "Pinning hook banner..."
+          : "Generating subtitles...",
     });
 
-    // Generate ASS file with trim offset so timestamps start at 0
     const assContent = generateSubtitles(
-      words,
-      captionOp,
+      words ?? [],
+      captionOp ?? null,
       trimStart,
-      trimEnd
+      trimEnd,
+      hookOp,
+      outputDurationForHook
     );
-    subtitlePath = join(projectDir, "captions.ass");
-    await writeFile(subtitlePath, assContent, "utf-8");
-    console.log(`[render:pipeline] ASS subtitle file written to: ${subtitlePath}`);
-    console.log(`[render:pipeline] ASS content length: ${assContent.length} chars`);
-    console.log(`[render:pipeline] ASS first 500 chars:`, assContent.slice(0, 500));
+
+    if (assContent) {
+      subtitlePath = join(projectDir, "captions.ass");
+      await writeFile(subtitlePath, assContent, "utf-8");
+      console.log(`[render:pipeline] ASS subtitle file written to: ${subtitlePath}`);
+      console.log(`[render:pipeline] ASS content length: ${assContent.length} chars`);
+      console.log(`[render:pipeline] ASS first 500 chars:`, assContent.slice(0, 500));
+    } else {
+      console.log(`[render:pipeline] ASS generator returned null — nothing to render`);
+    }
   }
 
-  // 2. Build FFmpeg command
+  // 2. Collect illustration ops up-front so we can start Nano Banana generation
+  // IN PARALLEL with the main FFmpeg encode. Image gen takes ~3-5s per image on
+  // the wire — running it concurrently with the encode shaves real time.
+  const illustrationOps = edl.operations.filter(
+    (op, i) => op.type === "illustration" && !disabled.has(i)
+  ) as IllustrationOperation[];
+
+  const mergedIllustrations = illustrationOps.flatMap((op) => op.illustrations ?? []);
+  const mergedIllustrationOp: IllustrationOperation | undefined =
+    mergedIllustrations.length > 0
+      ? { type: "illustration", illustrations: mergedIllustrations }
+      : undefined;
+
+  if (illustrationOps.length > 1) {
+    console.log(`[render:pipeline] Merged ${illustrationOps.length} illustration ops into ${mergedIllustrations.length} overlays`);
+  }
+
+  // Kick off Nano Banana generation NOW (not awaited). It runs in the background
+  // while FFmpeg encodes. We await this promise later, just before the overlay pass.
+  let illustrationPromise: Promise<Awaited<ReturnType<typeof generateIllustrations>>> | null = null;
+
+  if (mergedIllustrationOp && mergedIllustrationOp.illustrations.length > 0) {
+    const keyRows = await db
+      .select()
+      .from(apiKeys)
+      .where(and(eq(apiKeys.userId, userId), eq(apiKeys.provider, "gemini")))
+      .limit(1);
+
+    if (keyRows.length === 0) {
+      console.log(`[render:pipeline] No Gemini API key — skipping illustration overlays. Add one in Settings to enable.`);
+    } else {
+      const apiKey = decrypt({
+        encryptedKey: keyRows[0].encryptedKey,
+        iv: keyRows[0].iv,
+        authTag: keyRows[0].authTag,
+      });
+
+      const adjustedIllustrations = mergedIllustrationOp.illustrations.map((ill) => ({
+        ...ill,
+        startTime: Math.max(0, ill.startTime - trimStart),
+        endTime: ill.endTime - trimStart,
+      }));
+
+      console.log(`[render:pipeline] Kicking off ${adjustedIllustrations.length} Nano Banana generations in parallel with encode`);
+
+      illustrationPromise = generateIllustrations(
+        { ...mergedIllustrationOp, illustrations: adjustedIllustrations },
+        projectDir,
+        apiKey,
+        (current, total) => {
+          emitProgress(projectId, {
+            stage: "rendering",
+            // Keep progress in the 0-15 range while encode hasn't started;
+            // the encode callback (15-90) overrides visually anyway.
+            progress: 5 + Math.round((current / total) * 10),
+            currentStep: `Generating illustrations ${current}/${total} (in background)...`,
+          });
+        }
+      ).catch((err) => {
+        console.log(`[render:pipeline] Illustration generation failed (non-fatal):`, err instanceof Error ? err.message : err);
+        return [] as Awaited<ReturnType<typeof generateIllustrations>>;
+      });
+    }
+  }
+
+  // 3. Build FFmpeg command
   emitProgress(projectId, {
     stage: "rendering",
     progress: 10,
@@ -224,7 +395,7 @@ export async function renderVideo(data: RenderJobData): Promise<string> {
       // Insert software preset before -c:a
       const caIdx = cleanArgs.indexOf("-c:a");
       if (caIdx > 0) {
-        cleanArgs.splice(caIdx, 0, "-preset", "fast", "-crf", "23");
+        cleanArgs.splice(caIdx, 0, "-preset", "veryfast", "-crf", "23");
       }
 
       emitProgress(projectId, {
@@ -257,105 +428,58 @@ export async function renderVideo(data: RenderJobData): Promise<string> {
     console.log(`[render:pipeline] Could not verify output streams:`, err instanceof Error ? err.message : err);
   }
 
-  // 4. Illustration overlays (separate pass if illustrations exist)
-  // The model sometimes emits multiple illustration ops — merge them all into one.
-  const illustrationOps = edl.operations.filter(
-    (op, i) => op.type === "illustration" && !disabled.has(i)
-  ) as IllustrationOperation[];
-
-  const mergedIllustrations = illustrationOps.flatMap((op) => op.illustrations ?? []);
-  const illustrationOp: IllustrationOperation | undefined =
-    mergedIllustrations.length > 0
-      ? { type: "illustration", illustrations: mergedIllustrations }
-      : undefined;
-
-  if (illustrationOps.length > 1) {
-    console.log(`[render:pipeline] Merged ${illustrationOps.length} illustration ops into ${mergedIllustrations.length} overlays`);
-  }
-
-  if (illustrationOp && illustrationOp.illustrations?.length > 0) {
+  // 4. Illustration overlay pass — await the background generation kicked off
+  // before the encode. If nothing was generated (no Gemini key, all failed),
+  // skip the second FFmpeg pass entirely.
+  if (illustrationPromise) {
     emitProgress(projectId, {
       stage: "rendering",
-      progress: 82,
-      currentStep: "Generating illustrations...",
+      progress: 88,
+      currentStep: "Waiting for illustrations...",
     });
 
-    // Get API key for Nano Banana (Gemini 2.5 Flash Image)
-    try {
-      const keyRows = await db
-        .select()
-        .from(apiKeys)
-        .where(and(eq(apiKeys.userId, userId), eq(apiKeys.provider, "gemini")))
-        .limit(1);
+    const generatedImages = await illustrationPromise;
 
-      if (keyRows.length === 0) {
-        console.log(`[render:pipeline] No Gemini API key configured — skipping illustration overlays. Add one in Settings to enable.`);
-      }
+    if (generatedImages.length > 0) {
+      emitProgress(projectId, {
+        stage: "rendering",
+        progress: 90,
+        currentStep: `Overlaying ${generatedImages.length} illustrations...`,
+      });
 
-      if (keyRows.length > 0) {
-        const apiKey = decrypt({
-          encryptedKey: keyRows[0].encryptedKey,
-          iv: keyRows[0].iv,
-          authTag: keyRows[0].authTag,
-        });
+      const illustOutputPath = join(projectDir, "output_illustrated.mp4");
+      const { width: outW, height: outH } = computeOutputDimensions(edl, disabled);
+      console.log(`[render:pipeline] Overlay pass dimensions: ${outW}x${outH}`);
 
-        // Adjust illustration timestamps for trim offset
-        const adjustedIllustrations = illustrationOp.illustrations.map((ill) => ({
-          ...ill,
-          startTime: Math.max(0, ill.startTime - trimStart),
-          endTime: ill.endTime - trimStart,
-        }));
+      const overlayArgs = buildIllustrationOverlayArgs(
+        outputPath,
+        illustOutputPath,
+        generatedImages.map((img) => ({
+          imagePath: img.imagePath,
+          startTime: img.startTime,
+          endTime: img.endTime,
+          position: img.position,
+          opacity: img.opacity,
+          animation: img.animation,
+        })),
+        outW,
+        outH
+      );
 
-        const generatedImages = await generateIllustrations(
-          { ...illustrationOp, illustrations: adjustedIllustrations },
-          projectDir,
-          apiKey,
-          (current, total) => {
-            const pct = 82 + Math.round((current / total) * 8);
-            emitProgress(projectId, {
-              stage: "rendering",
-              progress: pct,
-              currentStep: `Generating illustration ${current}/${total}...`,
-            });
-          }
-        );
-
-        if (generatedImages.length > 0) {
+      if (overlayArgs.length > 0) {
+        await runFFmpeg(overlayArgs, estimatedDuration, (percent) => {
           emitProgress(projectId, {
             stage: "rendering",
-            progress: 90,
-            currentStep: "Overlaying illustrations...",
+            progress: 90 + Math.round(percent * 0.07),
+            currentStep: `Overlaying illustrations... ${percent}%`,
           });
-
-          // Overlay pass: output.mp4 -> output_with_illust.mp4 -> rename back
-          const illustOutputPath = join(projectDir, "output_illustrated.mp4");
-
-          const overlayArgs = buildIllustrationOverlayArgs(
-            outputPath,
-            illustOutputPath,
-            generatedImages.map((img) => ({
-              imagePath: img.imagePath,
-              startTime: img.startTime,
-              endTime: img.endTime,
-              position: img.position,
-              opacity: img.opacity,
-            })),
-            edl.sourceVideo.width,
-            edl.sourceVideo.height
-          );
-
-          if (overlayArgs.length > 0) {
-            await runFFmpeg(overlayArgs, estimatedDuration, () => {});
-
-            // Replace output with illustrated version
-            const { rename } = await import("fs/promises");
-            await rename(illustOutputPath, outputPath);
-            console.log(`[render:pipeline] Illustration overlay complete`);
-          }
-        }
+        });
+        const { rename } = await import("fs/promises");
+        await rename(illustOutputPath, outputPath);
+        console.log(`[render:pipeline] Illustration overlay complete`);
       }
-    } catch (err) {
-      console.log(`[render:pipeline] Illustration generation failed (non-fatal):`, err instanceof Error ? err.message : err);
+    } else {
+      console.log(`[render:pipeline] No illustrations produced, skipping overlay pass`);
     }
   }
 

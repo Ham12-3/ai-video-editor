@@ -1,17 +1,8 @@
 "use client";
 
-import { Button } from "@/components/ui/button";
-import { Badge } from "@/components/ui/badge";
-import { Separator } from "@/components/ui/separator";
-import {
-  Download,
-  RotateCcw,
-  Plus,
-  Clock,
-  HardDrive,
-  Maximize,
-} from "lucide-react";
 import Link from "next/link";
+import { useState } from "react";
+import { toast } from "sonner";
 
 interface CompletedViewProps {
   sourceVideoUrl: string;
@@ -23,10 +14,10 @@ interface CompletedViewProps {
 }
 
 function formatDuration(seconds: number | null): string {
-  if (!seconds) return "0:00";
+  if (!seconds) return "—";
   const m = Math.floor(seconds / 60);
   const s = Math.floor(seconds % 60);
-  return `${m}:${s.toString().padStart(2, "0")}`;
+  return `${m.toString().padStart(2, "0")}:${s.toString().padStart(2, "0")}`;
 }
 
 export function CompletedView({
@@ -37,6 +28,8 @@ export function CompletedView({
   sourceResolution,
   onEditFurther,
 }: CompletedViewProps) {
+  const [copied, setCopied] = useState(false);
+
   const handleDownload = () => {
     const a = document.createElement("a");
     a.href = outputVideoUrl;
@@ -46,18 +39,97 @@ export function CompletedView({
     document.body.removeChild(a);
   };
 
+  const handleCopyLink = async () => {
+    try {
+      await navigator.clipboard.writeText(new URL(outputVideoUrl, window.location.origin).toString());
+      setCopied(true);
+      toast.success("Share link copied");
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      toast.error("Couldn't copy link");
+    }
+  };
+
   return (
-    <div className="space-y-6">
-      {/* Side-by-side video comparison */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        <div>
-          <div className="flex items-center gap-2 mb-2">
-            <Badge variant="outline" className="text-xs">Original</Badge>
-            <span className="text-xs text-muted-foreground">
-              {formatDuration(sourceDuration)}
-            </span>
-          </div>
-          <div className="aspect-video bg-black rounded-lg overflow-hidden">
+    <div className="flex flex-col lg:flex-row gap-8 lg:gap-12 items-start">
+      {/* Vertical output preview */}
+      <div className="w-full max-w-[260px] lg:w-[340px] lg:max-w-none shrink-0 aspect-[9/16] bg-surface-inverse flex flex-col justify-end p-5 gap-2 relative">
+        <video
+          src={outputVideoUrl}
+          controls
+          autoPlay
+          loop
+          muted
+          playsInline
+          preload="metadata"
+          className="absolute inset-0 w-full h-full object-cover"
+        />
+        <div className="relative z-10 flex flex-col gap-2 pointer-events-none">
+          <span className="inline-flex w-fit px-3 py-1.5 bg-yellow-300 text-foreground text-[11px] font-mono tracking-[0.15em] uppercase">
+            Shipped
+          </span>
+          <span className="font-mono text-[10px] text-foreground-inverse tracking-wide">
+            {formatDuration(outputDuration)} · 9:16 · 1080×1920
+          </span>
+        </div>
+      </div>
+
+      {/* Right column */}
+      <div className="flex-1 flex flex-col gap-9">
+        <div className="flex flex-col gap-4">
+          <span className="tag">Shipped · ready to download</span>
+          <h2 className="font-heading text-[56px] sm:text-[72px] lg:text-[96px] tracking-[-0.035em] leading-none">
+            It&rsquo;s done.
+          </h2>
+          <p className="font-heading italic text-[18px] lg:text-[20px] tracking-[-0.015em] leading-[1.45] max-w-[560px]">
+            Your edited video is ready. The file is yours, download it, share it, or start
+            another project. Nothing left behind on our machines.
+          </p>
+        </div>
+
+        {/* Stats row */}
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-y-4 gap-x-6 border-t border-b border-border py-5">
+          <Stat label="Duration" value={formatDuration(outputDuration ?? sourceDuration)} />
+          <Stat label="Source" value={formatDuration(sourceDuration)} />
+          <Stat label="Resolution" value={sourceResolution || "1080p"} />
+          <Stat label="Format" value="MP4 · H.264" />
+        </div>
+
+        {/* Actions */}
+        <div className="flex flex-wrap items-center gap-3">
+          <button
+            type="button"
+            onClick={handleDownload}
+            className="inline-flex items-center gap-3 bg-foreground text-foreground-inverse px-7 py-4 text-[15px] font-medium hover:bg-foreground/90 transition-colors"
+          >
+            Download MP4 <span aria-hidden>↓</span>
+          </button>
+          <button
+            type="button"
+            onClick={handleCopyLink}
+            className="inline-flex items-center px-6 py-4 text-sm border border-foreground hover:bg-foreground hover:text-foreground-inverse transition-colors"
+          >
+            {copied ? "Copied" : "Copy share link"}
+          </button>
+          <button
+            type="button"
+            onClick={onEditFurther}
+            className="inline-flex items-center px-5 py-4 text-sm hover:bg-muted transition-colors"
+          >
+            Edit further
+          </button>
+          <Link
+            href="/projects/new"
+            className="inline-flex items-center gap-2 px-5 py-4 text-sm hover:bg-muted transition-colors"
+          >
+            Start another project <span aria-hidden>→</span>
+          </Link>
+        </div>
+
+        {/* Before/after compare */}
+        <div className="flex flex-col gap-3">
+          <span className="tag">Before · Source clip</span>
+          <div className="aspect-video bg-surface-inverse max-w-[560px]">
             <video
               src={sourceVideoUrl}
               controls
@@ -66,67 +138,16 @@ export function CompletedView({
             />
           </div>
         </div>
-
-        <div>
-          <div className="flex items-center gap-2 mb-2">
-            <Badge className="text-xs bg-primary/10 text-primary border-primary/20">
-              Edited
-            </Badge>
-            {outputDuration && (
-              <span className="text-xs text-muted-foreground">
-                {formatDuration(outputDuration)}
-              </span>
-            )}
-          </div>
-          <div className="aspect-video bg-black rounded-lg overflow-hidden">
-            <video
-              src={outputVideoUrl}
-              controls
-              className="w-full h-full"
-              preload="metadata"
-              autoPlay
-            />
-          </div>
-        </div>
       </div>
+    </div>
+  );
+}
 
-      {/* Actions */}
-      <div className="flex flex-wrap items-center gap-3">
-        <Button onClick={handleDownload} className="gap-2">
-          <Download className="h-4 w-4" />
-          Download MP4
-        </Button>
-        <Button variant="outline" onClick={onEditFurther} className="gap-2">
-          <RotateCcw className="h-4 w-4" />
-          Edit Further
-        </Button>
-        <Link href="/projects/new">
-          <Button variant="outline" className="gap-2">
-            <Plus className="h-4 w-4" />
-            New Project
-          </Button>
-        </Link>
-      </div>
-
-      <Separator />
-
-      {/* Export options */}
-      <div>
-        <h3 className="text-sm font-semibold mb-3">Re-export at different resolution</h3>
-        <div className="flex gap-2">
-          {["1080p", "720p", "480p"].map((res) => (
-            <Button
-              key={res}
-              variant="outline"
-              size="sm"
-              disabled={res !== "1080p"}
-              title={res === "1080p" ? "Current resolution" : "Coming soon"}
-            >
-              {res}
-            </Button>
-          ))}
-        </div>
-      </div>
+function Stat({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="flex flex-col gap-1">
+      <span className="tag">{label}</span>
+      <span className="font-heading text-[28px] tracking-[-0.018em] leading-none">{value}</span>
     </div>
   );
 }

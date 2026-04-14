@@ -1,188 +1,357 @@
 "use client";
 
 import Link from "next/link";
+import { useEffect, useState } from "react";
 import { trpc } from "@/lib/trpc/client";
-import { Button } from "@/components/ui/button";
-import { Badge } from "@/components/ui/badge";
-import {
-  Card,
-  CardContent,
-} from "@/components/ui/card";
-import {
-  Plus,
-  Film,
-  Clock,
-  MoreHorizontal,
-  Trash2,
-  ExternalLink,
-  Loader2,
-} from "lucide-react";
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
+import { cn } from "@/lib/utils";
+import { toast } from "sonner";
 
-const statusColors: Record<string, string> = {
-  uploading: "bg-yellow-500/10 text-yellow-500 border-yellow-500/20",
-  uploaded: "bg-blue-500/10 text-blue-500 border-blue-500/20",
-  analyzing: "bg-purple-500/10 text-purple-500 border-purple-500/20",
-  editing: "bg-purple-500/10 text-purple-500 border-purple-500/20",
-  rendering: "bg-orange-500/10 text-orange-500 border-orange-500/20",
-  completed: "bg-emerald-500/10 text-emerald-500 border-emerald-500/20",
-  failed: "bg-red-500/10 text-red-500 border-red-500/20",
+const STATUS_LABEL: Record<string, string> = {
+  uploading: "UPLOADING",
+  uploaded: "READY",
+  analyzing: "ANALYSING",
+  editing: "EDITING",
+  rendering: "RENDERING",
+  completed: "SHIPPED",
+  failed: "FAILED",
 };
 
 function formatDuration(seconds: number | null): string {
-  if (!seconds) return "0:00";
+  if (!seconds) return "—";
   const m = Math.floor(seconds / 60);
   const s = Math.floor(seconds % 60);
-  return `${m}:${s.toString().padStart(2, "0")}`;
+  return `${m.toString().padStart(2, "0")}:${s.toString().padStart(2, "0")}`;
 }
 
-function formatDate(date: string | Date): string {
-  return new Date(date).toLocaleDateString("en-US", {
+function formatRelative(date: string | Date): string {
+  const d = new Date(date);
+  const diffMs = Date.now() - d.getTime();
+  const diffMin = Math.round(diffMs / 60_000);
+  if (diffMin < 1) return "Just now";
+  if (diffMin < 60) return `${diffMin} minute${diffMin === 1 ? "" : "s"} ago`;
+  const diffHr = Math.round(diffMin / 60);
+  if (diffHr < 24) return `${diffHr} hour${diffHr === 1 ? "" : "s"} ago`;
+  return d.toLocaleString("en-GB", {
+    weekday: "short",
+    day: "2-digit",
     month: "short",
-    day: "numeric",
-    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
   });
+}
+
+function opsSummary(project: { editDecisionList?: unknown }): string {
+  const edl = project.editDecisionList as { operations?: { type: string }[] } | null;
+  const ops = edl?.operations ?? [];
+  if (ops.length === 0) return "No edits yet";
+  const types = new Set(ops.map((o) => o.type));
+  const pretty: Record<string, string> = {
+    trim: "Trim",
+    cut: "Cuts",
+    silence_remove: "Silence cut",
+    speed: "Speed",
+    reframe: "Reframe",
+    caption: "Captions",
+    illustration: "Illustrations",
+    transition: "Transitions",
+  };
+  return Array.from(types).map((t) => pretty[t] ?? t).join(", ");
+}
+
+function StatusBadge({ status }: { status: string }) {
+  const label = STATUS_LABEL[status] ?? status.toUpperCase();
+  if (status === "editing" || status === "rendering" || status === "analyzing") {
+    return (
+      <span className="inline-flex items-center px-2.5 py-1 bg-foreground text-foreground-inverse tag !text-foreground-inverse">
+        {label}
+      </span>
+    );
+  }
+  if (status === "failed") {
+    return (
+      <span className="inline-flex items-center px-2.5 py-1 border border-accent tag !text-accent">
+        {label}
+      </span>
+    );
+  }
+  return (
+    <span className="inline-flex items-center px-2.5 py-1 border border-foreground tag !text-foreground">
+      {label}
+    </span>
+  );
 }
 
 export default function ProjectsPage() {
-  const { data: projects, isLoading } = trpc.project.list.useQuery();
-  const utils = trpc.useUtils();
+  const { data: projects, isLoading, refetch } = trpc.project.list.useQuery(
+    undefined,
+    {
+      // If ANY project is mid-way through a server-side process, poll every 3s
+      // so the list stays in sync (status badge flips EDITING → SHIPPED, new
+      // uploads appear automatically, etc).
+      refetchInterval: (query) => {
+        const list = query.state.data ?? [];
+        const hasActive = list.some((p) =>
+          ["uploading", "uploaded", "analyzing", "editing", "rendering"].includes(p.status)
+        );
+        return hasActive ? 3000 : false;
+      },
+      refetchOnWindowFocus: true,
+    }
+  );
   const deleteProject = trpc.project.delete.useMutation({
     onSuccess: () => {
-      utils.project.list.invalidate();
+      toast.success("Project deleted");
+      refetch();
+    },
+    onError: (err) => {
+      toast.error(err.message || "Couldn't delete project");
     },
   });
+  const [pendingDelete, setPendingDelete] = useState<{
+    id: string;
+    title: string;
+  } | null>(null);
 
   if (isLoading) {
     return (
-      <div className="flex items-center justify-center h-full min-h-[60vh]">
-        <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
+      <div className="min-h-[60vh] flex items-center justify-center">
+        <span className="font-mono text-sm italic text-muted-foreground">Loading projects…</span>
       </div>
     );
   }
 
+  const total = projects?.length ?? 0;
+  const shipped = projects?.filter((p) => p.status === "completed").length ?? 0;
+
   return (
-    <div className="p-8 max-w-6xl">
-      <div className="flex items-center justify-between mb-8">
-        <div>
-          <h1 className="text-2xl font-bold tracking-tight">Projects</h1>
-          <p className="text-sm text-muted-foreground mt-1">
-            Your video editing projects
-          </p>
+    <div className="px-6 sm:px-10 lg:px-14 py-8 lg:py-12 max-w-[1180px]">
+      <header className="flex flex-col sm:flex-row sm:items-end sm:justify-between gap-5 mb-7 lg:mb-9">
+        <div className="flex flex-col gap-1">
+          <span className="tag">
+            {total === 0
+              ? "No projects yet"
+              : `${total} ${total === 1 ? "project" : "projects"} · ${shipped} shipped`}
+          </span>
+          <h1 className="text-[36px] sm:text-[44px] lg:text-[52px] font-heading font-normal tracking-[-0.028em] leading-none">
+            Your projects
+          </h1>
         </div>
-        <Link href="/projects/new">
-          <Button className="gap-2">
-            <Plus className="h-4 w-4" />
-            New Project
-          </Button>
+        <Link
+          href="/projects/new"
+          className="inline-flex items-center gap-2 bg-foreground text-foreground-inverse px-5 py-3.5 text-sm font-medium hover:bg-foreground/90 transition-colors w-fit"
+        >
+          New project <span aria-hidden>+</span>
         </Link>
-      </div>
+      </header>
 
-      {!projects || projects.length === 0 ? (
-        <Card className="border-dashed">
-          <CardContent className="flex flex-col items-center justify-center py-16 text-center">
-            <div className="rounded-full bg-primary/10 p-4 mb-4">
-              <Film className="h-8 w-8 text-primary" />
-            </div>
-            <h3 className="text-lg font-semibold mb-2">No projects yet</h3>
-            <p className="text-sm text-muted-foreground mb-6 max-w-sm">
-              Upload a video and describe the edits you want. ClipForge will
-              handle the rest using AI.
-            </p>
-            <Link href="/projects/new">
-              <Button className="gap-2">
-                <Plus className="h-4 w-4" />
-                Create your first project
-              </Button>
-            </Link>
-          </CardContent>
-        </Card>
+      {total === 0 ? (
+        <EmptyState />
       ) : (
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-          {projects.map((project) => (
-            <Link key={project.id} href={`/projects/${project.id}`}>
-              <Card className="group hover:border-primary/30 transition-colors cursor-pointer">
-                {/* Thumbnail */}
-                <div className="aspect-video bg-muted/50 rounded-t-lg overflow-hidden relative">
-                  {project.thumbnailUrl ? (
-                    <img
-                      src={project.thumbnailUrl}
-                      alt={project.title}
-                      className="w-full h-full object-cover"
-                    />
-                  ) : (
-                    <div className="flex items-center justify-center h-full">
-                      <Film className="h-10 w-10 text-muted-foreground/30" />
-                    </div>
-                  )}
-                  {project.sourceVideoDuration && (
-                    <div className="absolute bottom-2 right-2 bg-black/70 px-1.5 py-0.5 rounded text-xs font-mono">
-                      {formatDuration(project.sourceVideoDuration)}
-                    </div>
-                  )}
-                </div>
-
-                <CardContent className="p-4 space-y-3">
-                  <div className="flex items-start justify-between">
-                    <h3 className="font-medium text-sm truncate flex-1 pr-2">
-                      {project.title}
-                    </h3>
-                    <DropdownMenu>
-                      <DropdownMenuTrigger
-                        className="opacity-0 group-hover:opacity-100 transition-opacity p-1 rounded hover:bg-accent"
-                        onClick={(e) => e.preventDefault()}
-                      >
-                        <MoreHorizontal className="h-4 w-4 text-muted-foreground" />
-                      </DropdownMenuTrigger>
-                      <DropdownMenuContent align="end">
-                        <DropdownMenuItem
-                          className="gap-2"
-                          onClick={(e) => {
-                            e.preventDefault();
-                            window.location.href = `/projects/${project.id}`;
-                          }}
-                        >
-                          <ExternalLink className="h-4 w-4" />
-                          Open
-                        </DropdownMenuItem>
-                        <DropdownMenuItem
-                          onClick={(e) => {
-                            e.preventDefault();
-                            deleteProject.mutate({ id: project.id });
-                          }}
-                          variant="destructive"
-                          className="gap-2"
-                        >
-                          <Trash2 className="h-4 w-4" />
-                          Delete
-                        </DropdownMenuItem>
-                      </DropdownMenuContent>
-                    </DropdownMenu>
+        <>
+          <div className="border-t border-foreground">
+            {/* Desktop header row — hidden on mobile, shown at md+ */}
+            <div className="hidden md:grid grid-cols-[32px_1fr_140px_100px_180px_72px] gap-6 py-3.5 border-b border-border">
+              <span className="tag">#</span>
+              <span className="tag">Project</span>
+              <span className="tag">Status</span>
+              <span className="tag">Length</span>
+              <span className="tag">Updated</span>
+              <span className="tag"></span>
+            </div>
+            {projects!.map((project, i) => {
+              const n = total - i;
+              const isFailed = project.status === "failed";
+              const isUntitled = !project.title || project.title === "Untitled Project";
+              return (
+                <div
+                  key={project.id}
+                  className="group relative flex flex-col md:grid md:grid-cols-[32px_1fr_140px_100px_180px_72px] gap-2 md:gap-6 py-4 md:py-5 border-b border-border md:items-center hover:bg-muted/40 transition-colors"
+                >
+                  <Link
+                    href={`/projects/${project.id}`}
+                    aria-label={`Open ${project.title || "untitled project"}`}
+                    className="absolute inset-0 z-0"
+                  />
+                  {/* Row 1 (mobile): number · relative time · status badge */}
+                  <div className="flex md:hidden items-center justify-between gap-3 relative z-10 pointer-events-none">
+                    <span className="font-mono text-[11px] tracking-[0.18em] uppercase text-muted-foreground">
+                      {n.toString().padStart(2, "0")} · {formatRelative(project.updatedAt ?? project.createdAt)}
+                    </span>
+                    <StatusBadge status={project.status} />
                   </div>
-
-                  <div className="flex items-center gap-2">
-                    <Badge
-                      variant="outline"
-                      className={statusColors[project.status] ?? ""}
+                  {/* Desktop: number column */}
+                  <span className="hidden md:inline font-mono text-[13px] text-muted-foreground relative z-10 pointer-events-none">
+                    {n.toString().padStart(2, "0")}
+                  </span>
+                  {/* Project title + subtitle */}
+                  <div className="flex flex-col gap-0.5 relative z-10 pointer-events-none">
+                    <span
+                      className={cn(
+                        "font-heading text-[18px] md:text-[19px] tracking-[-0.015em] leading-tight",
+                        isUntitled && "italic text-muted-foreground"
+                      )}
                     >
-                      {project.status}
-                    </Badge>
-                    <span className="text-xs text-muted-foreground flex items-center gap-1">
-                      <Clock className="h-3 w-3" />
-                      {formatDate(project.createdAt)}
+                      {project.title || "Untitled project"}
+                    </span>
+                    <span
+                      className={cn(
+                        "text-[13px]",
+                        isFailed ? "text-accent" : "text-muted-foreground"
+                      )}
+                    >
+                      {isFailed
+                        ? "Render failed · tap to retry"
+                        : `${opsSummary(project)} · ${formatDuration(project.sourceVideoDuration)}`}
                     </span>
                   </div>
-                </CardContent>
-              </Card>
-            </Link>
-          ))}
-        </div>
+                  {/* Desktop-only columns: status / length / updated */}
+                  <div className="hidden md:block relative z-10 pointer-events-none">
+                    <StatusBadge status={project.status} />
+                  </div>
+                  <span className="hidden md:inline font-mono text-[13px] relative z-10 pointer-events-none">
+                    {formatDuration(project.sourceVideoDuration)}
+                  </span>
+                  <span className="hidden md:inline text-[13px] text-muted-foreground relative z-10 pointer-events-none">
+                    {formatRelative(project.updatedAt ?? project.createdAt)}
+                  </span>
+                  {/* Delete action — visible on mobile, hover-reveal on desktop */}
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      setPendingDelete({
+                        id: project.id,
+                        title: project.title || "Untitled project",
+                      });
+                    }}
+                    aria-label={`Delete ${project.title || "project"}`}
+                    className="relative z-10 self-start md:self-center md:justify-self-end font-mono text-[11px] tracking-[0.18em] uppercase text-muted-foreground hover:text-accent transition-opacity md:opacity-0 md:group-hover:opacity-100 focus-visible:opacity-100"
+                  >
+                    Delete
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+
+          <div className="mt-12 flex flex-col gap-1.5 max-w-xl">
+            <span className="tag">Empty state invitation</span>
+            <p className="font-heading italic text-[20px] tracking-[-0.015em] leading-[1.45]">
+              Got a clip lying in your Downloads folder? Drop it in. First render is on your own key.
+            </p>
+          </div>
+        </>
       )}
+
+      <ConfirmDeleteDialog
+        project={pendingDelete}
+        onCancel={() => setPendingDelete(null)}
+        onConfirm={() => {
+          if (pendingDelete) {
+            deleteProject.mutate({ id: pendingDelete.id });
+            setPendingDelete(null);
+          }
+        }}
+        pending={deleteProject.isPending}
+      />
+    </div>
+  );
+}
+
+function ConfirmDeleteDialog({
+  project,
+  onCancel,
+  onConfirm,
+  pending,
+}: {
+  project: { id: string; title: string } | null;
+  onCancel: () => void;
+  onConfirm: () => void;
+  pending: boolean;
+}) {
+  useEffect(() => {
+    if (!project) return;
+    const handler = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onCancel();
+    };
+    document.addEventListener("keydown", handler);
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => {
+      document.removeEventListener("keydown", handler);
+      document.body.style.overflow = prev;
+    };
+  }, [project, onCancel]);
+
+  if (!project) return null;
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center p-6 bg-surface-inverse/70 backdrop-blur-[1px]"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="delete-dialog-title"
+      onClick={onCancel}
+    >
+      <div
+        className="relative w-full max-w-[480px] bg-background border border-foreground flex flex-col"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="px-8 pt-8 pb-5 flex flex-col gap-2">
+          <span className="tag !text-accent">Delete project</span>
+          <h2
+            id="delete-dialog-title"
+            className="font-heading text-[30px] tracking-[-0.022em] leading-[1.1]"
+          >
+            Delete &ldquo;{project.title}&rdquo;?
+          </h2>
+          <p className="text-[14px] text-muted-foreground leading-[1.55] mt-1">
+            This removes the project, its edit plan, and the rendered output from our server.
+            The source file and render will be gone. This cannot be undone.
+          </p>
+        </div>
+        <div className="px-8 py-5 border-t border-border flex items-center justify-end gap-2.5">
+          <button
+            type="button"
+            onClick={onCancel}
+            disabled={pending}
+            className="px-5 py-2.5 text-[13px] hover:bg-muted transition-colors disabled:opacity-40"
+          >
+            Keep it
+          </button>
+          <button
+            type="button"
+            onClick={onConfirm}
+            disabled={pending}
+            autoFocus
+            className="inline-flex items-center gap-2 border border-accent text-accent px-5 py-2.5 text-[13px] font-medium hover:bg-accent hover:text-foreground-inverse transition-colors disabled:opacity-40"
+          >
+            {pending ? "Deleting…" : <>Delete permanently <span aria-hidden>→</span></>}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function EmptyState() {
+  return (
+    <div className="border-t border-foreground pt-16 flex flex-col items-start gap-6 max-w-xl">
+      <span className="tag">Your first render</span>
+      <h2 className="font-heading text-[36px] tracking-[-0.022em] leading-[1.1]">
+        Upload a talking head. Describe the edit. Ship a vertical video.
+      </h2>
+      <p className="text-base text-muted-foreground leading-[1.55]">
+        ClipForge trims dead air, speeds up slow bits, drops in karaoke captions, reframes for TikTok,
+        and fills the screen with real photos of whatever you mention. Your keys, your cost.
+      </p>
+      <Link
+        href="/projects/new"
+        className="inline-flex items-center gap-2 bg-foreground text-foreground-inverse px-6 py-4 text-base font-medium hover:bg-foreground/90 transition-colors"
+      >
+        Start your first edit <span aria-hidden>→</span>
+      </Link>
     </div>
   );
 }

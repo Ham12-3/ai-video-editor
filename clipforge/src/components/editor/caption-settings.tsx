@@ -1,12 +1,7 @@
 "use client";
 
 import type { CaptionOperation } from "@/types/edl";
-import { Button } from "@/components/ui/button";
-import { Label } from "@/components/ui/label";
-import { Input } from "@/components/ui/input";
-import { Separator } from "@/components/ui/separator";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Type } from "lucide-react";
+import { cn } from "@/lib/utils";
 
 const FONT_OPTIONS = [
   "Arial Black",
@@ -30,7 +25,7 @@ const SIZE_OPTIONS = ["small", "medium", "large"] as const;
 
 const POSITION_OPTIONS: Array<{ value: CaptionOperation["position"]; label: string }> = [
   { value: "top-center", label: "Top" },
-  { value: "center", label: "Center" },
+  { value: "center", label: "Middle" },
   { value: "bottom-center", label: "Bottom" },
 ];
 
@@ -38,24 +33,20 @@ const BORDER_OPTIONS = ["outline", "box", "none"] as const;
 
 const COLOR_PRESETS = [
   { color: "#FFFFFF", label: "White" },
-  { color: "#FFFF00", label: "Yellow" },
-  { color: "#00FFFF", label: "Cyan" },
-  { color: "#FF6B6B", label: "Red" },
-  { color: "#4ECDC4", label: "Teal" },
-  { color: "#FF69B4", label: "Pink" },
+  { color: "#FFEB3B", label: "Yellow" },
+  { color: "#F3EBE2", label: "Linen" },
+  { color: "#1A1A1A", label: "Black" },
+  { color: "#B03E16", label: "Rust" },
+  { color: "#3D3D3D", label: "Graphite" },
 ];
 
 const BG_PRESETS = [
   { color: "#000000C0", label: "Dark" },
   { color: "#000000FF", label: "Solid" },
+  { color: "#1A1A1A", label: "Near-black" },
   { color: "#00000000", label: "None" },
-  { color: "#000000A0", label: "Semi" },
 ];
 
-/**
- * Normalize the AI's position value to our strict type.
- * AI might return "bottom", "bottom-center", "top", etc.
- */
 function normalizePosition(pos: string): CaptionOperation["position"] {
   const p = (pos || "").toLowerCase();
   if (p.includes("top")) return "top-center";
@@ -63,9 +54,6 @@ function normalizePosition(pos: string): CaptionOperation["position"] {
   return "bottom-center";
 }
 
-/**
- * Normalize font size. AI might return "extra-large", "xl", etc.
- */
 function normalizeFontSize(size: string): CaptionOperation["fontSize"] {
   const s = (size || "").toLowerCase();
   if (s.includes("small")) return "small";
@@ -73,9 +61,6 @@ function normalizeFontSize(size: string): CaptionOperation["fontSize"] {
   return "medium";
 }
 
-/**
- * Normalize caption style.
- */
 function normalizeStyle(style: string): CaptionOperation["style"] {
   const s = (style || "").toLowerCase();
   if (s.includes("karaoke")) return "karaoke";
@@ -90,7 +75,6 @@ interface CaptionSettingsProps {
 }
 
 export function CaptionSettings({ caption, onChange }: CaptionSettingsProps) {
-  // Normalize AI values so buttons show the right selection
   const currentStyle = normalizeStyle(caption.style);
   const currentSize = normalizeFontSize(caption.fontSize);
   const currentPosition = normalizePosition(caption.position);
@@ -105,225 +89,211 @@ export function CaptionSettings({ caption, onChange }: CaptionSettingsProps) {
     onChange({ ...caption, ...partial });
   };
 
-  const previewFontSize = currentSize === "small" ? 18 : currentSize === "large" ? 30 : 24;
+  const previewFontSize = currentSize === "small" ? 18 : currentSize === "large" ? 32 : 24;
 
   return (
-    <Card>
-      <CardHeader className="pb-3">
-        <CardTitle className="text-sm flex items-center gap-2">
-          <Type className="h-4 w-4 text-primary" />
-          Caption Settings
-        </CardTitle>
-      </CardHeader>
-      <CardContent className="space-y-5">
-        {/* Live preview */}
-        <div
-          className="rounded-lg p-6 flex items-center justify-center min-h-[80px]"
-          style={{ backgroundColor: "#18181b" }}
+    <section className="flex flex-col gap-6">
+      <div className="flex items-end justify-between">
+        <h3 className="font-heading text-[24px] tracking-[-0.015em] leading-tight">
+          Caption settings
+        </h3>
+        <span className="tag">Applied on render</span>
+      </div>
+
+      {/* Live preview */}
+      <div className="bg-surface-inverse flex items-center justify-center min-h-[120px] p-8">
+        <span
+          style={{
+            fontFamily: currentFont,
+            fontSize: previewFontSize,
+            fontWeight: currentWeight === "bold" ? 700 : 400,
+            color: currentFontColor,
+            textShadow:
+              currentBorder === "none"
+                ? "none"
+                : `0 0 ${currentOutline}px #000, 2px 2px 2px #000`,
+            backgroundColor: currentBorder === "box" ? currentBgColor : "transparent",
+            padding: currentBorder === "box" ? "6px 14px" : "0",
+            WebkitTextStroke:
+              currentBorder === "outline"
+                ? `${Math.min(currentOutline, 2)}px black`
+                : "none",
+          }}
         >
-          <span
-            style={{
-              fontFamily: currentFont,
-              fontSize: previewFontSize,
-              fontWeight: currentWeight === "bold" ? 700 : 400,
-              color: currentFontColor,
-              textShadow:
-                currentBorder === "none"
-                  ? "none"
-                  : `0 0 ${currentOutline}px #000, 2px 2px 2px #000`,
-              backgroundColor:
-                currentBorder === "box" ? currentBgColor : "transparent",
-              padding: currentBorder === "box" ? "4px 12px" : "0",
-              borderRadius: currentBorder === "box" ? "4px" : "0",
-              WebkitTextStroke:
-                currentBorder === "outline"
-                  ? `${Math.min(currentOutline, 2)}px black`
-                  : "none",
-            }}
-          >
-            Sample Caption Text
-          </span>
-        </div>
+          Sample caption text
+        </span>
+      </div>
 
-        {/* Caption style */}
-        <div className="space-y-2">
-          <Label className="text-xs text-muted-foreground">Style</Label>
-          <div className="flex gap-1.5">
-            {STYLE_OPTIONS.map((opt) => (
-              <Button
-                key={opt.value}
-                variant={currentStyle === opt.value ? "default" : "outline"}
-                size="sm"
-                className="text-xs flex-1"
-                onClick={() => update({ style: opt.value })}
-              >
-                {opt.label}
-              </Button>
-            ))}
-          </div>
-        </div>
+      {/* Style */}
+      <Row label="Style">
+        <OptionGroup
+          options={STYLE_OPTIONS.map((o) => ({ value: o.value, label: o.label }))}
+          value={currentStyle}
+          onChange={(v) => update({ style: v as CaptionOperation["style"] })}
+        />
+      </Row>
 
-        {/* Font family */}
-        <div className="space-y-2">
-          <Label className="text-xs text-muted-foreground">Font</Label>
-          <select
-            className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
-            value={currentFont}
-            onChange={(e) => update({ fontFamily: e.target.value })}
-          >
-            {FONT_OPTIONS.map((f) => (
-              <option key={f} value={f} style={{ fontFamily: f }}>
-                {f}
-              </option>
-            ))}
-          </select>
-        </div>
+      {/* Font */}
+      <Row label="Font family">
+        <select
+          className="w-full px-3.5 py-2.5 text-sm bg-background border border-border focus:border-foreground focus:outline-none"
+          value={currentFont}
+          onChange={(e) => update({ fontFamily: e.target.value })}
+        >
+          {FONT_OPTIONS.map((f) => (
+            <option key={f} value={f} style={{ fontFamily: f }}>
+              {f}
+            </option>
+          ))}
+        </select>
+      </Row>
 
-        <div className="grid grid-cols-2 gap-4">
-          {/* Font size */}
-          <div className="space-y-2">
-            <Label className="text-xs text-muted-foreground">Size</Label>
-            <div className="flex gap-1">
-              {SIZE_OPTIONS.map((size) => (
-                <Button
-                  key={size}
-                  variant={currentSize === size ? "default" : "outline"}
-                  size="sm"
-                  className="text-xs flex-1"
-                  onClick={() => update({ fontSize: size })}
-                >
-                  {size === "small" ? "S" : size === "medium" ? "M" : "L"}
-                </Button>
-              ))}
-            </div>
-          </div>
+      {/* Size + weight */}
+      <div className="grid grid-cols-2 gap-6">
+        <Row label="Size">
+          <OptionGroup
+            options={SIZE_OPTIONS.map((s) => ({
+              value: s,
+              label: s === "small" ? "S" : s === "medium" ? "M" : "L",
+            }))}
+            value={currentSize}
+            onChange={(v) => update({ fontSize: v as CaptionOperation["fontSize"] })}
+          />
+        </Row>
+        <Row label="Weight">
+          <OptionGroup
+            options={[
+              { value: "bold", label: "Bold" },
+              { value: "normal", label: "Normal" },
+            ]}
+            value={currentWeight}
+            onChange={(v) => update({ fontWeight: v as "bold" | "normal" })}
+          />
+        </Row>
+      </div>
 
-          {/* Font weight */}
-          <div className="space-y-2">
-            <Label className="text-xs text-muted-foreground">Weight</Label>
-            <div className="flex gap-1">
-              <Button
-                variant={currentWeight === "bold" ? "default" : "outline"}
-                size="sm"
-                className="text-xs flex-1"
-                onClick={() => update({ fontWeight: "bold" })}
-              >
-                Bold
-              </Button>
-              <Button
-                variant={currentWeight === "normal" ? "default" : "outline"}
-                size="sm"
-                className="text-xs flex-1"
-                onClick={() => update({ fontWeight: "normal" })}
-              >
-                Normal
-              </Button>
-            </div>
-          </div>
-        </div>
+      {/* Position */}
+      <Row label="Position">
+        <OptionGroup
+          options={POSITION_OPTIONS.map((p) => ({ value: p.value, label: p.label }))}
+          value={currentPosition}
+          onChange={(v) => update({ position: v as CaptionOperation["position"] })}
+        />
+      </Row>
 
-        {/* Position */}
-        <div className="space-y-2">
-          <Label className="text-xs text-muted-foreground">Position</Label>
-          <div className="flex gap-1.5">
-            {POSITION_OPTIONS.map((opt) => (
-              <Button
-                key={opt.value}
-                variant={currentPosition === opt.value ? "default" : "outline"}
-                size="sm"
-                className="text-xs flex-1"
-                onClick={() => update({ position: opt.value })}
-              >
-                {opt.label}
-              </Button>
-            ))}
-          </div>
-        </div>
+      <div className="h-px bg-border" />
 
-        <Separator />
-
-        {/* Font color */}
-        <div className="space-y-2">
-          <Label className="text-xs text-muted-foreground">Text color</Label>
-          <div className="flex gap-2 items-center">
-            {COLOR_PRESETS.map((p) => (
-              <button
-                key={p.color}
-                className={`w-7 h-7 rounded-full border-2 transition-all ${
-                  currentFontColor.toUpperCase() === p.color
-                    ? "border-primary scale-110"
-                    : "border-border"
-                }`}
-                style={{ backgroundColor: p.color }}
-                onClick={() => update({ fontColor: p.color })}
-                title={p.label}
-              />
-            ))}
-            <Input
+      {/* Text colour */}
+      <Row label="Text colour">
+        <div className="flex items-center gap-2.5 flex-wrap">
+          {COLOR_PRESETS.map((p) => (
+            <button
+              type="button"
+              key={p.color}
+              className={cn(
+                "w-7 h-7 transition-all",
+                currentFontColor.toUpperCase() === p.color.toUpperCase()
+                  ? "ring-2 ring-offset-2 ring-offset-background ring-foreground"
+                  : "border border-border hover:ring-1 hover:ring-foreground/30"
+              )}
+              style={{ backgroundColor: p.color }}
+              onClick={() => update({ fontColor: p.color })}
+              title={p.label}
+              aria-label={`Use ${p.label}`}
+            />
+          ))}
+          <label className="ml-2 flex items-center gap-2 text-[12px] text-muted-foreground cursor-pointer hover:text-foreground transition-colors">
+            <input
               type="color"
               value={currentFontColor.slice(0, 7)}
               onChange={(e) => update({ fontColor: e.target.value.toUpperCase() })}
-              className="w-8 h-8 p-0 border-0 cursor-pointer"
+              className="w-7 h-7 p-0 border border-border bg-transparent cursor-pointer"
             />
-          </div>
+            Custom
+          </label>
         </div>
+      </Row>
 
-        {/* Background */}
-        <div className="space-y-2">
-          <Label className="text-xs text-muted-foreground">Background</Label>
-          <div className="flex gap-2 items-center">
-            {BG_PRESETS.map((p) => (
-              <Button
-                key={p.color}
-                variant={currentBgColor === p.color ? "default" : "outline"}
-                size="sm"
-                className="text-xs"
-                onClick={() => update({ backgroundColor: p.color })}
-              >
-                {p.label}
-              </Button>
-            ))}
-          </div>
-        </div>
+      {/* Background */}
+      <Row label="Background">
+        <OptionGroup
+          options={BG_PRESETS.map((p) => ({ value: p.color, label: p.label }))}
+          value={currentBgColor}
+          onChange={(v) => update({ backgroundColor: v })}
+        />
+      </Row>
 
-        <Separator />
+      <div className="h-px bg-border" />
 
-        {/* Border style */}
-        <div className="space-y-2">
-          <Label className="text-xs text-muted-foreground">Border</Label>
-          <div className="flex gap-1.5">
-            {BORDER_OPTIONS.map((opt) => (
-              <Button
-                key={opt}
-                variant={currentBorder === opt ? "default" : "outline"}
-                size="sm"
-                className="text-xs flex-1"
-                onClick={() => update({ borderStyle: opt })}
-              >
-                {opt.charAt(0).toUpperCase() + opt.slice(1)}
-              </Button>
-            ))}
-          </div>
-        </div>
+      {/* Border style */}
+      <Row label="Border">
+        <OptionGroup
+          options={BORDER_OPTIONS.map((o) => ({
+            value: o,
+            label: o.charAt(0).toUpperCase() + o.slice(1),
+          }))}
+          value={currentBorder}
+          onChange={(v) => update({ borderStyle: v as CaptionOperation["borderStyle"] })}
+        />
+      </Row>
 
-        {/* Outline width */}
-        {currentBorder === "outline" && (
-          <div className="space-y-2">
-            <Label className="text-xs text-muted-foreground">
-              Outline: {currentOutline}px
-            </Label>
-            <input
-              type="range"
-              min={0}
-              max={8}
-              step={1}
-              value={currentOutline}
-              onChange={(e) => update({ outlineWidth: parseInt(e.target.value) })}
-              className="w-full accent-primary"
-            />
-          </div>
-        )}
-      </CardContent>
-    </Card>
+      {/* Outline width */}
+      {currentBorder === "outline" && (
+        <Row label={`Outline · ${currentOutline}px`}>
+          <input
+            type="range"
+            min={0}
+            max={8}
+            step={1}
+            value={currentOutline}
+            onChange={(e) => update({ outlineWidth: parseInt(e.target.value) })}
+            className="w-full accent-foreground"
+          />
+        </Row>
+      )}
+    </section>
+  );
+}
+
+function Row({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <div className="flex flex-col gap-2">
+      <span className="tag">{label}</span>
+      {children}
+    </div>
+  );
+}
+
+function OptionGroup<T extends string>({
+  options,
+  value,
+  onChange,
+}: {
+  options: Array<{ value: T; label: string }>;
+  value: T;
+  onChange: (v: T) => void;
+}) {
+  return (
+    <div className="flex flex-wrap gap-0 border border-border">
+      {options.map((opt, i) => {
+        const isActive = opt.value === value;
+        return (
+          <button
+            type="button"
+            key={String(opt.value)}
+            onClick={() => onChange(opt.value)}
+            className={cn(
+              "flex-1 px-3 py-2 text-[13px] transition-colors whitespace-nowrap",
+              i > 0 && "border-l border-border",
+              isActive
+                ? "bg-foreground text-foreground-inverse font-medium"
+                : "bg-background hover:bg-muted"
+            )}
+          >
+            {opt.label}
+          </button>
+        );
+      })}
+    </div>
   );
 }

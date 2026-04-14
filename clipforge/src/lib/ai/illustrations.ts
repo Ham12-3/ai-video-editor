@@ -11,6 +11,7 @@ interface GeneratedIllustration {
   prompt: string;
   position: string;
   opacity: number;
+  animation?: "none" | "fade" | "slide" | "kenburns";
 }
 
 // Nano Banana 2 — Google's latest image model (released Feb 2026).
@@ -38,12 +39,13 @@ async function generateOneImage(
   context: string
 ): Promise<Buffer | null> {
   const fullPrompt = [
-    `Create a clear, literal illustration of: ${prompt}.`,
+    `Create a photorealistic photograph of: ${prompt}.`,
     `Context from the video narration: "${context}".`,
-    "Show the actual subject realistically and recognizably. The viewer must instantly identify what is shown and connect it to the narration.",
-    "Composition: centered subject on a clean background, bold and readable at small sizes, high contrast.",
-    "Style: modern, vibrant, polished illustration suitable for overlaying on a talking-head video.",
-    "Do NOT include any text, letters, words, captions, or watermarks in the image.",
+    "IMPORTANT: this must look like a real photograph of the actual subject, not an illustration, cartoon, drawing, painting, or stylised art. Think high-quality stock photo or editorial image.",
+    "The viewer must instantly recognise the exact thing being described. If the subject is a specific product, person, place, object, or brand, depict it accurately and literally.",
+    "Composition: the subject is clearly in focus and centred, natural lighting, realistic colours, shallow depth of field, clean uncluttered background so it reads well at small sizes.",
+    "Do NOT produce an illustration, cartoon, drawing, 3D render, vector art, or clip art. Real photo only.",
+    "Do NOT include any text, letters, words, captions, logos of unrelated brands, or watermarks.",
   ].join(" ");
 
   const response = await fetch(`${NANO_BANANA_ENDPOINT}?key=${encodeURIComponent(apiKey)}`, {
@@ -69,9 +71,30 @@ async function generateOneImage(
   return null;
 }
 
+const MAX_CONCURRENT_IMAGES = 4;
+
+async function runWithConcurrency<T, R>(
+  items: T[],
+  limit: number,
+  worker: (item: T, index: number) => Promise<R>
+): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let cursor = 0;
+  const runners = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (true) {
+      const idx = cursor++;
+      if (idx >= items.length) return;
+      results[idx] = await worker(items[idx], idx);
+    }
+  });
+  await Promise.all(runners);
+  return results;
+}
+
 /**
- * Generate illustration overlays using Gemini 2.5 Flash Image (Nano Banana).
- * Each illustration segment in the EDL gets a literal on-topic image.
+ * Generate illustration overlays using Nano Banana 2 (Gemini 3.1 Flash Image).
+ * Runs up to MAX_CONCURRENT_IMAGES requests in parallel — each image takes ~3-5s
+ * on the wire, so concurrency is the biggest win for end-to-end render time.
  */
 export async function generateIllustrations(
   operation: IllustrationOperation,
@@ -82,49 +105,57 @@ export async function generateIllustrations(
   const illustrationsDir = join(projectDir, "illustrations");
   await mkdir(illustrationsDir, { recursive: true });
 
-  const results: GeneratedIllustration[] = [];
   const total = operation.illustrations.length;
+  console.log(
+    `[illustrations] Generating ${total} illustrations with Nano Banana (${NANO_BANANA_MODEL}), concurrency=${MAX_CONCURRENT_IMAGES}`
+  );
 
-  console.log(`[illustrations] Generating ${total} illustrations with Nano Banana (${NANO_BANANA_MODEL})`);
+  let completed = 0;
 
-  for (let i = 0; i < total; i++) {
-    const illust = operation.illustrations[i];
-    onProgress?.(i + 1, total);
-
-    console.log(
-      `[illustrations] ${i + 1}/${total}: "${illust.prompt}" (${illust.startTime.toFixed(1)}s - ${illust.endTime.toFixed(1)}s)`
-    );
-
-    try {
-      const buf = await generateOneImage(apiKey, illust.prompt, illust.context ?? "");
-      if (!buf) {
-        console.log(`[illustrations] ${i + 1}: no image returned, skipping`);
-        continue;
-      }
-
-      const imagePath = join(illustrationsDir, `illust_${i.toString().padStart(3, "0")}.png`);
-      await writeFile(imagePath, buf);
-
-      results.push({
-        index: i,
-        startTime: illust.startTime,
-        endTime: illust.endTime,
-        imagePath,
-        prompt: illust.prompt,
-        position: illust.position,
-        opacity: illust.opacity,
-      });
-
-      console.log(`[illustrations] ${i + 1}: saved to ${imagePath}`);
-    } catch (err) {
+  const all = await runWithConcurrency(
+    operation.illustrations,
+    MAX_CONCURRENT_IMAGES,
+    async (illust, i): Promise<GeneratedIllustration | null> => {
       console.log(
-        `[illustrations] ${i + 1}: generation failed:`,
-        err instanceof Error ? err.message : err
+        `[illustrations] ${i + 1}/${total} START: "${illust.prompt}" (${illust.startTime.toFixed(1)}s - ${illust.endTime.toFixed(1)}s)`
       );
-      // Non-fatal, skip this illustration
-    }
-  }
+      try {
+        const buf = await generateOneImage(apiKey, illust.prompt, illust.context ?? "");
+        if (!buf) {
+          console.log(`[illustrations] ${i + 1}: no image returned, skipping`);
+          return null;
+        }
 
+        const imagePath = join(illustrationsDir, `illust_${i.toString().padStart(3, "0")}.png`);
+        await writeFile(imagePath, buf);
+
+        console.log(`[illustrations] ${i + 1}/${total} DONE: ${imagePath}`);
+        return {
+          index: i,
+          startTime: illust.startTime,
+          endTime: illust.endTime,
+          imagePath,
+          prompt: illust.prompt,
+          position: illust.position,
+          opacity: illust.opacity,
+          animation: (illust as { animation?: "none" | "fade" | "slide" | "kenburns" }).animation,
+        };
+      } catch (err) {
+        console.log(
+          `[illustrations] ${i + 1}: generation failed:`,
+          err instanceof Error ? err.message : err
+        );
+        return null;
+      } finally {
+        completed++;
+        onProgress?.(completed, total);
+      }
+    }
+  );
+
+  const results = all.filter((r): r is GeneratedIllustration => r !== null);
+  // Keep original EDL order for predictable overlay stacking
+  results.sort((a, b) => a.index - b.index);
   console.log(`[illustrations] Generated ${results.length}/${total} illustrations`);
   return results;
 }

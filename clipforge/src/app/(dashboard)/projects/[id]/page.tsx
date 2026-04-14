@@ -2,10 +2,6 @@
 
 import { use, useState, useEffect, useCallback, useRef } from "react";
 import { trpc } from "@/lib/trpc/client";
-import { Button } from "@/components/ui/button";
-import { Textarea } from "@/components/ui/textarea";
-import { Badge } from "@/components/ui/badge";
-import { Separator } from "@/components/ui/separator";
 import { ProgressSteps } from "@/components/editor/progress-steps";
 import { EdlViewer } from "@/components/editor/edl-viewer";
 import { CostDialog } from "@/components/editor/cost-dialog";
@@ -13,17 +9,7 @@ import { RenderProgress } from "@/components/editor/render-progress";
 import { CompletedView } from "@/components/editor/completed-view";
 import { CaptionSettings } from "@/components/editor/caption-settings";
 import type { CaptionOperation } from "@/types/edl";
-import {
-  ArrowLeft,
-  Play,
-  Clock,
-  Maximize,
-  HardDrive,
-  Film,
-  Loader2,
-  Sparkles,
-  RotateCcw,
-} from "lucide-react";
+import { Film } from "lucide-react";
 import Link from "next/link";
 import { toast } from "sonner";
 import type { EditDecisionList } from "@/types/edl";
@@ -60,7 +46,27 @@ export default function ProjectEditorPage({
   params: Promise<{ id: string }>;
 }) {
   const { id } = use(params);
-  const { data: project, isLoading, refetch } = trpc.project.getById.useQuery({ id });
+  const { data: project, isLoading, refetch } = trpc.project.getById.useQuery(
+    { id },
+    {
+      // Poll every 2s while the project is mid-way through any server-side
+      // process so the UI updates without the user hitting refresh. Stops the
+      // moment status becomes a terminal one.
+      refetchInterval: (query) => {
+        const p = query.state.data;
+        if (!p) return 2000; // still loading initially
+        const busy = [
+          "uploading",
+          "uploaded",
+          "analyzing",
+          "editing",
+          "rendering",
+        ].includes(p.status);
+        return busy ? 2000 : false;
+      },
+      refetchOnWindowFocus: true,
+    }
+  );
   const [prompt, setPrompt] = useState("");
   const [processing, setProcessing] = useState(false);
   const [currentStage, setCurrentStage] = useState("");
@@ -79,20 +85,48 @@ export default function ProjectEditorPage({
   const [outputVideoUrl, setOutputVideoUrl] = useState<string | null>(null);
   const eventSourceRef = useRef<EventSource | null>(null);
 
-  // Load existing EDL from project
+  // Sync local UI flags to the server status whenever the polled project
+  // updates. This is the safety net: if SSE drops mid-analysis (dev mode hot
+  // reload, flaky network, connection timeout), polling eventually picks up
+  // the real server status and the UI flips out of "processing" / "rendering"
+  // state even without the edl_complete / render_complete SSE events.
   useEffect(() => {
-    if (project?.editDecisionList) {
+    if (!project) return;
+
+    if (project.editDecisionList) {
       const data = project.editDecisionList as EditDecisionList & { _meta?: Record<string, number> };
       setEdl(data);
       if (data._meta) {
         setEdlMeta(data._meta);
       }
     }
-    if (project?.prompt) {
+    if (project.prompt) {
       setPrompt(project.prompt);
     }
-    if (project?.outputVideoUrl) {
+    if (project.outputVideoUrl) {
       setOutputVideoUrl(project.outputVideoUrl);
+    }
+
+    // Status-driven flag reconciliation — the canonical source of truth.
+    switch (project.status) {
+      case "analyzing":
+        // Server is actively analysing; make sure the UI reflects it.
+        setProcessing(true);
+        setRendering(false);
+        break;
+      case "rendering":
+        setProcessing(false);
+        setRendering(true);
+        break;
+      case "editing":
+      case "completed":
+      case "failed":
+        // Terminal-ish states: analysis done or render done. Clear local flags
+        // so the UI exits the progress views even if SSE never delivered the
+        // terminal event.
+        setProcessing(false);
+        setRendering(false);
+        break;
     }
   }, [project]);
 
@@ -182,6 +216,30 @@ export default function ProjectEditorPage({
     },
     [refetch]
   );
+
+  // Auto-connect SSE whenever the server reports ACTIVE work (analyzing or
+  // rendering). Re-checks on every poll — if the old connection died silently
+  // (readyState === CLOSED), re-opens. Without this the user has to click
+  // Analyse or Render for any live events, and dropped connections would leave
+  // the page frozen forever.
+  useEffect(() => {
+    if (!project) return;
+    const isActive =
+      project.status === "analyzing" ||
+      project.status === "rendering" ||
+      project.status === "uploading";
+    const connectionDead =
+      !eventSourceRef.current ||
+      eventSourceRef.current.readyState === EventSource.CLOSED;
+    if (isActive && connectionDead) {
+      console.log(
+        `[page] Auto-connecting SSE for status=${project.status}${
+          eventSourceRef.current ? " (previous connection closed)" : ""
+        }`
+      );
+      connectSSE(project.id);
+    }
+  }, [project, connectSSE]);
 
   // Clean up SSE on unmount
   useEffect(() => {
@@ -298,20 +356,21 @@ export default function ProjectEditorPage({
   if (isLoading) {
     return (
       <div className="flex items-center justify-center h-full min-h-[60vh]">
-        <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
+        <span className="font-mono text-sm italic text-muted-foreground">Loading project…</span>
       </div>
     );
   }
 
   if (!project) {
     return (
-      <div className="flex flex-col items-center justify-center h-full min-h-[60vh] gap-4">
-        <p className="text-muted-foreground">Project not found</p>
-        <Link href="/projects">
-          <Button variant="ghost" className="gap-2">
-            <ArrowLeft className="h-4 w-4" />
-            Back to projects
-          </Button>
+      <div className="flex flex-col items-center justify-center h-full min-h-[60vh] gap-5">
+        <span className="tag">Project not found</span>
+        <p className="font-heading text-[28px] tracking-[-0.018em]">This project has moved on.</p>
+        <Link
+          href="/projects"
+          className="inline-flex items-center gap-2 px-5 py-3 text-sm border border-foreground hover:bg-foreground hover:text-foreground-inverse transition-colors"
+        >
+          ← Back to projects
         </Link>
       </div>
     );
@@ -333,25 +392,35 @@ export default function ProjectEditorPage({
   return (
     <div className="flex flex-col h-screen">
       {/* Top bar */}
-      <div className="border-b border-border/50 px-6 py-3 flex items-center justify-between">
-        <div className="flex items-center gap-3">
-          <Link href="/projects">
-            <Button variant="ghost" size="icon" className="h-8 w-8">
-              <ArrowLeft className="h-4 w-4" />
-            </Button>
+      <div className="border-b border-border px-6 lg:px-10 py-5 lg:py-7 flex items-end justify-between gap-4 lg:gap-6">
+        <div className="flex flex-col gap-1 min-w-0 flex-1">
+          <Link
+            href="/projects"
+            className="tag hover:text-foreground transition-colors"
+          >
+            ← Projects · Editor
           </Link>
-          <h1 className="font-semibold text-sm">{project.title}</h1>
-          <Badge variant="outline" className="text-xs">
-            {project.status}
-          </Badge>
+          <h1 className="font-heading text-[22px] sm:text-[28px] lg:text-[36px] tracking-[-0.022em] leading-tight truncate">
+            {project.title}
+          </h1>
+        </div>
+        <div className="flex items-center gap-2.5 shrink-0">
+          {hasEdl && !isAnalyzing && !isRendering && !isCompleted && (
+            <button
+              type="button"
+              onClick={handleRender}
+              className="inline-flex items-center gap-2.5 bg-foreground text-foreground-inverse px-5 py-3 text-sm font-medium hover:bg-foreground/90 transition-colors"
+            >
+              Render video <span aria-hidden>→</span>
+            </button>
+          )}
         </div>
       </div>
 
       {/* Main content */}
       <div className="flex flex-1 overflow-hidden">
-        {/* Video + Prompt area */}
-        <div className="flex-1 flex flex-col p-6 overflow-auto">
-          {/* Completed: side-by-side comparison */}
+        {/* Main area */}
+        <div className="flex-1 flex flex-col px-6 lg:px-10 py-6 lg:py-8 overflow-auto gap-6 lg:gap-8">
           {isCompleted && project.sourceVideoUrl && (project.outputVideoUrl || outputVideoUrl) ? (
             <CompletedView
               sourceVideoUrl={project.sourceVideoUrl}
@@ -367,49 +436,45 @@ export default function ProjectEditorPage({
             />
           ) : (
             <>
-              {/* Video player */}
-              <div className="aspect-video bg-black rounded-lg overflow-hidden mb-6 relative">
+              {/* Video preview */}
+              <div className="shrink-0 w-full aspect-video max-h-[560px] bg-surface-inverse overflow-hidden relative">
                 {project.sourceVideoUrl ? (
                   <video
                     src={project.sourceVideoUrl}
                     controls
-                    className="w-full h-full"
                     preload="metadata"
+                    className="absolute inset-0 w-full h-full object-contain bg-surface-inverse"
                   />
                 ) : (
-                  <div className="flex items-center justify-center h-full text-muted-foreground">
-                    <Film className="h-12 w-12 opacity-30" />
+                  <div className="absolute inset-0 flex items-center justify-center">
+                    <Film className="h-12 w-12 opacity-25 text-foreground-inverse" />
                   </div>
                 )}
               </div>
 
               {/* Render progress */}
               {isRendering && (
-                <div className="mb-6">
-                  <RenderProgress
-                    progress={renderProgress}
-                    currentStep={renderStep}
-                    startedAt={renderStartedAt}
-                  />
-                </div>
+                <RenderProgress
+                  progress={renderProgress}
+                  currentStep={renderStep}
+                  startedAt={renderStartedAt}
+                />
               )}
 
               {/* Analysis progress */}
               {isAnalyzing && !isRendering && (
-                <div className="mb-6">
-                  <ProgressSteps
-                    currentStage={currentStage}
-                    progress={stageProgress}
-                    estimatedCost={estimatedCost}
-                    frameCount={frameCount}
-                    error={error}
-                  />
-                </div>
+                <ProgressSteps
+                  currentStage={currentStage}
+                  progress={stageProgress}
+                  estimatedCost={estimatedCost}
+                  frameCount={frameCount}
+                  error={error}
+                />
               )}
 
-              {/* EDL Viewer */}
+              {/* EDL Viewer + refine */}
               {hasEdl && !isAnalyzing && !isRendering && (
-                <div className="mb-6">
+                <div className="flex flex-col gap-8">
                   <EdlViewer
                     edl={edl}
                     meta={edlMeta}
@@ -417,46 +482,40 @@ export default function ProjectEditorPage({
                     onToggleOp={handleToggleOp}
                   />
 
-                  {/* Caption customization */}
                   {captionOp && (
-                    <div className="mt-4">
-                      <CaptionSettings
-                        caption={captionOp}
-                        onChange={handleCaptionChange}
-                      />
-                    </div>
+                    <CaptionSettings
+                      caption={captionOp}
+                      onChange={handleCaptionChange}
+                    />
                   )}
 
                   {/* Refine input */}
-                  <div className="mt-4 space-y-3">
-                    <label className="text-sm font-medium">
-                      Refine your edit
-                    </label>
-                    <Textarea
-                      placeholder='Example: "Keep the pause at 0:45" or "Make the captions bigger"'
+                  <div className="flex flex-col gap-3">
+                    <label className="tag">Refine your edit</label>
+                    <textarea
+                      placeholder='Make the captions larger and remove that stutter at 00:47…'
                       value={prompt}
                       onChange={(e) => setPrompt(e.target.value)}
                       rows={3}
-                      className="resize-none"
+                      className="w-full px-4 py-3.5 text-[14px] bg-card border border-border focus:border-foreground focus:outline-none placeholder:italic placeholder:text-muted-foreground/70 resize-none leading-[1.55]"
                     />
-                    <div className="flex gap-2">
-                      <Button
+                    <div className="flex items-center gap-2.5">
+                      <button
+                        type="button"
                         onClick={handleProcess}
                         disabled={!prompt.trim() || isAnalyzing || isRendering}
-                        className="gap-2"
-                        variant="outline"
+                        className="inline-flex items-center px-5 py-3 text-[13px] font-medium border border-foreground hover:bg-foreground hover:text-foreground-inverse transition-colors disabled:opacity-40 disabled:hover:bg-transparent disabled:hover:text-foreground"
                       >
-                        <RotateCcw className="h-4 w-4" />
-                        Re-analyze
-                      </Button>
-                      <Button
+                        Re-analyse
+                      </button>
+                      <button
+                        type="button"
                         onClick={handleRender}
                         disabled={isRendering || isAnalyzing}
-                        className="gap-2"
+                        className="inline-flex items-center gap-2.5 bg-foreground text-foreground-inverse px-5 py-3 text-[13px] font-medium hover:bg-foreground/90 transition-colors disabled:opacity-40"
                       >
-                        <Sparkles className="h-4 w-4" />
-                        Render Video
-                      </Button>
+                        Render video <span aria-hidden>→</span>
+                      </button>
                     </div>
                   </div>
                 </div>
@@ -464,104 +523,79 @@ export default function ProjectEditorPage({
 
               {/* Initial prompt input (no EDL yet) */}
               {!hasEdl && !isAnalyzing && !isRendering && (
-                <div className="space-y-3">
-                  <label className="text-sm font-medium">
-                    Describe how you want to edit this video
-                  </label>
-                  <Textarea
-                    placeholder='Example: "Remove all silences, add karaoke-style captions, and reframe to vertical 9:16 for TikTok"'
+                <div className="flex flex-col gap-5 max-w-[720px]">
+                  <div className="flex flex-col gap-1.5">
+                    <span className="tag">First edit</span>
+                    <h2 className="font-heading text-[32px] tracking-[-0.022em] leading-tight">
+                      Describe how you want it cut.
+                    </h2>
+                  </div>
+                  <textarea
+                    placeholder='Trim the dead air. Remove silences and filler words. Speed up to 1.2×. Reframe to 9:16. Add karaoke captions. Drop in real photos of whatever I mention.'
                     value={prompt}
                     onChange={(e) => setPrompt(e.target.value)}
-                    rows={4}
-                    className="resize-none"
+                    rows={5}
+                    className="w-full px-5 py-4 text-[15px] bg-card border border-border focus:border-foreground focus:outline-none placeholder:italic placeholder:text-muted-foreground/70 resize-none leading-[1.55]"
                   />
                   {error && (
-                    <div className="text-sm text-destructive bg-destructive/10 rounded-md px-3 py-2">
+                    <div className="border border-accent px-4 py-3 text-sm text-accent">
                       {error}
                     </div>
                   )}
-                  <Button
-                    onClick={handleProcess}
-                    disabled={!prompt.trim() || isAnalyzing}
-                    className="gap-2"
-                  >
-                    <Sparkles className="h-4 w-4" />
-                    Process Video
-                  </Button>
+                  <div>
+                    <button
+                      type="button"
+                      onClick={handleProcess}
+                      disabled={!prompt.trim() || isAnalyzing}
+                      className="inline-flex items-center gap-2.5 bg-foreground text-foreground-inverse px-6 py-3.5 text-sm font-medium hover:bg-foreground/90 transition-colors disabled:opacity-40"
+                    >
+                      Analyse video <span aria-hidden>→</span>
+                    </button>
+                  </div>
                 </div>
               )}
             </>
           )}
         </div>
 
-        {/* Metadata sidebar */}
-        <div className="w-72 border-l border-border/50 p-6 overflow-auto">
-          <h2 className="text-sm font-semibold mb-4">Video Details</h2>
-
-          <div className="space-y-4">
-            <div className="flex items-center gap-3">
-              <Clock className="h-4 w-4 text-muted-foreground" />
-              <div>
-                <p className="text-xs text-muted-foreground">Duration</p>
-                <p className="text-sm font-medium">
-                  {formatDuration(project.sourceVideoDuration)}
-                </p>
-              </div>
-            </div>
-
-            <div className="flex items-center gap-3">
-              <Maximize className="h-4 w-4 text-muted-foreground" />
-              <div>
-                <p className="text-xs text-muted-foreground">Resolution</p>
-                <p className="text-sm font-medium">
-                  {project.sourceVideoWidth && project.sourceVideoHeight
-                    ? `${project.sourceVideoWidth} x ${project.sourceVideoHeight}`
-                    : "Unknown"}
-                </p>
-              </div>
-            </div>
-
-            {project.sourceVideoFps && (
-              <div className="flex items-center gap-3">
-                <Play className="h-4 w-4 text-muted-foreground" />
-                <div>
-                  <p className="text-xs text-muted-foreground">Frame rate</p>
-                  <p className="text-sm font-medium">
-                    {Math.round(project.sourceVideoFps)} fps
-                  </p>
-                </div>
-              </div>
-            )}
-
-            <div className="flex items-center gap-3">
-              <HardDrive className="h-4 w-4 text-muted-foreground" />
-              <div>
-                <p className="text-xs text-muted-foreground">File size</p>
-                <p className="text-sm font-medium">
-                  {formatFileSize(project.sourceVideoSize)}
-                </p>
-              </div>
+        {/* Metadata sidebar — hide on narrower than xl, becomes inline inside main on smaller */}
+        <aside className="hidden xl:flex w-[260px] shrink-0 border-l border-border px-6 py-8 overflow-auto flex-col gap-8">
+          <div className="flex flex-col gap-4">
+            <h2 className="tag">Video details</h2>
+            <div className="flex flex-col gap-4">
+              <Stat label="Duration" value={formatDuration(project.sourceVideoDuration)} />
+              <Stat
+                label="Resolution"
+                value={
+                  project.sourceVideoWidth && project.sourceVideoHeight
+                    ? `${project.sourceVideoWidth} × ${project.sourceVideoHeight}`
+                    : "Unknown"
+                }
+              />
+              {project.sourceVideoFps && (
+                <Stat label="Frame rate" value={`${Math.round(project.sourceVideoFps)} fps`} />
+              )}
+              <Stat label="File size" value={formatFileSize(project.sourceVideoSize)} />
             </div>
           </div>
 
-          <Separator className="my-6" />
-
-          <h2 className="text-sm font-semibold mb-4">Quick Actions</h2>
-          <div className="space-y-2">
-            {QUICK_ACTIONS.map((action) => (
-              <Button
-                key={action.label}
-                variant="outline"
-                size="sm"
-                className="w-full justify-start text-xs"
-                disabled={isAnalyzing}
-                onClick={() => handleQuickAction(action.prompt)}
-              >
-                {action.label}
-              </Button>
-            ))}
+          <div className="flex flex-col gap-3">
+            <h2 className="tag">Quick actions</h2>
+            <div className="flex flex-col gap-0 border-t border-border">
+              {QUICK_ACTIONS.map((action) => (
+                <button
+                  type="button"
+                  key={action.label}
+                  disabled={isAnalyzing}
+                  onClick={() => handleQuickAction(action.prompt)}
+                  className="text-left text-[13px] py-2.5 border-b border-border hover:bg-muted/60 transition-colors disabled:opacity-40 disabled:hover:bg-transparent"
+                >
+                  {action.label}
+                </button>
+              ))}
+            </div>
           </div>
-        </div>
+        </aside>
       </div>
 
       {/* Cost confirmation dialog */}
@@ -575,6 +609,17 @@ export default function ProjectEditorPage({
         videoDuration={project.sourceVideoDuration ?? 0}
       />
 
+    </div>
+  );
+}
+
+function Stat({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="flex flex-col gap-1">
+      <span className="text-[11px] font-mono tracking-[0.14em] uppercase text-muted-foreground">
+        {label}
+      </span>
+      <span className="text-[14px]">{value}</span>
     </div>
   );
 }

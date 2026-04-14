@@ -2,27 +2,7 @@
 
 import { useState } from "react";
 import { trpc } from "@/lib/trpc/client";
-import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from "@/components/ui/card";
-import { Badge } from "@/components/ui/badge";
-import { Separator } from "@/components/ui/separator";
-import {
-  Key,
-  Shield,
-  CheckCircle2,
-  XCircle,
-  Loader2,
-  Trash2,
-  ExternalLink,
-} from "lucide-react";
+import { cn } from "@/lib/utils";
 import { toast } from "sonner";
 
 type Provider = "openai" | "anthropic" | "gemini";
@@ -33,48 +13,51 @@ const PROVIDER_LABEL: Record<Provider, string> = {
   gemini: "Google Gemini",
 };
 
-const PROVIDERS: Array<{
+interface ProviderDef {
   id: Provider;
+  number: string;
+  tag: string;
   name: string;
   description: string;
   placeholder: string;
   prefix: string;
   url: string;
   urlLabel: string;
-  models: string;
-}> = [
+}
+
+const PROVIDERS: ProviderDef[] = [
   {
     id: "openai",
-    name: "OpenAI",
-    description:
-      "Powers video analysis (GPT-5.4) and transcription (Whisper / gpt-4o-mini-transcribe). Illustrations now use Gemini Nano Banana.",
+    number: "01",
+    tag: "OpenAI",
+    name: "GPT-5.4 & Whisper",
+    description: "Video analysis and transcription. Required.",
     placeholder: "sk-...",
     prefix: "sk-",
     url: "https://platform.openai.com/api-keys",
     urlLabel: "platform.openai.com",
-    models: "GPT-5.4, Whisper",
-  },
-  {
-    id: "anthropic",
-    name: "Anthropic",
-    description:
-      "Alternative AI provider for video analysis using Claude Opus 4.6. Requires OpenAI key for transcription and illustrations.",
-    placeholder: "sk-ant-...",
-    prefix: "sk-ant-",
-    url: "https://console.anthropic.com/settings/keys",
-    urlLabel: "console.anthropic.com",
-    models: "Claude Opus 4.6, Claude Sonnet 4.6",
   },
   {
     id: "gemini",
-    name: "Google Gemini",
-    description:
-      "Generates on-topic illustration overlays using Nano Banana 2 (Gemini 3.1 Flash Image). Much better at literal, concrete images than DALL-E.",
+    number: "02",
+    tag: "Google Gemini",
+    name: "Nano Banana 2",
+    description: "Photorealistic illustration overlays. Optional, skipped if missing.",
     placeholder: "AIza...",
     prefix: "AIza",
     url: "https://aistudio.google.com/apikey",
     urlLabel: "aistudio.google.com",
-    models: "Nano Banana 2 (Gemini 3.1 Flash Image)",
+  },
+  {
+    id: "anthropic",
+    number: "03",
+    tag: "Anthropic",
+    name: "Claude Opus 4.6",
+    description: "Alternative analysis provider. Optional.",
+    placeholder: "sk-ant-...",
+    prefix: "sk-ant-",
+    url: "https://console.anthropic.com/settings/keys",
+    urlLabel: "console.anthropic.com",
   },
 ];
 
@@ -85,9 +68,7 @@ export default function SettingsPage() {
     gemini: "",
   });
   const [savingProvider, setSavingProvider] = useState<Provider | null>(null);
-  const [validatingProvider, setValidatingProvider] = useState<Provider | null>(
-    null
-  );
+  const [validatingProvider, setValidatingProvider] = useState<Provider | null>(null);
 
   const { data: allKeys, refetch } = trpc.apiKey.getAll.useQuery();
   const saveKey = trpc.apiKey.save.useMutation();
@@ -101,17 +82,14 @@ export default function SettingsPage() {
   async function handleSave(provider: Provider) {
     const key = newKeys[provider];
     if (!key.trim()) return;
-
     setSavingProvider(provider);
     try {
       await saveKey.mutateAsync({ key, provider });
       setNewKeys((prev) => ({ ...prev, [provider]: "" }));
-      toast.success(`${PROVIDER_LABEL[provider]} API key saved and encrypted`);
+      toast.success(`${PROVIDER_LABEL[provider]} API key saved`);
       refetch();
     } catch (err) {
-      toast.error(
-        err instanceof Error ? err.message : "Failed to save API key"
-      );
+      toast.error(err instanceof Error ? err.message : "Failed to save");
     } finally {
       setSavingProvider(null);
     }
@@ -121,11 +99,8 @@ export default function SettingsPage() {
     setValidatingProvider(provider);
     try {
       const result = await validateKey.mutateAsync({ provider });
-      if (result.valid) {
-        toast.success(`${PROVIDER_LABEL[provider]} API key is valid`);
-      } else {
-        toast.error(result.error ?? "Validation failed");
-      }
+      if (result.valid) toast.success(`${PROVIDER_LABEL[provider]} API key is valid`);
+      else toast.error(result.error ?? "Validation failed");
       refetch();
     } catch {
       toast.error("Validation failed");
@@ -145,152 +120,238 @@ export default function SettingsPage() {
   }
 
   return (
-    <div className="p-8 max-w-2xl">
-      <h1 className="text-2xl font-bold tracking-tight mb-2">Settings</h1>
-      <p className="text-sm text-muted-foreground mb-8">
-        Manage your account and API keys
-      </p>
+    <div className="px-6 sm:px-10 lg:px-14 py-8 lg:py-12 max-w-[1180px]">
+      <header className="flex flex-col gap-4 mb-7 lg:mb-9 max-w-3xl">
+        <span className="tag">API keys · Providers</span>
+        <h1 className="text-[36px] sm:text-[44px] lg:text-[52px] font-heading font-normal tracking-[-0.028em] leading-none">
+          Bring your own keys.
+        </h1>
+        <p className="text-sm text-muted-foreground leading-[1.55] max-w-2xl">
+          Encrypted with AES-256-GCM before we ever write them to disk. Only decrypted server-side
+          when we make an outbound call. Never sent to the browser, never logged.
+        </p>
+      </header>
 
-      {/* Security note */}
-      <div className="flex items-start gap-3 p-3 rounded-md bg-primary/5 border border-primary/10 mb-6">
-        <Shield className="h-4 w-4 text-primary mt-0.5 shrink-0" />
-        <div className="text-sm text-muted-foreground">
-          <p className="font-medium text-foreground mb-1">
-            How your keys are protected
-          </p>
-          <ul className="space-y-1 list-disc list-inside">
-            <li>Encrypted with AES-256-GCM before storage</li>
-            <li>Decrypted only server-side when making API calls</li>
-            <li>Never sent to the browser or exposed in logs</li>
-            <li>You can delete them at any time</li>
-          </ul>
-        </div>
-      </div>
-
-      <div className="space-y-6">
-        {PROVIDERS.map((provider) => {
-          const existing = getKeyForProvider(provider.id);
-          const isSaving = savingProvider === provider.id;
-          const isValidating = validatingProvider === provider.id;
-          const keyValue = newKeys[provider.id];
-
-          return (
-            <Card key={provider.id}>
-              <CardHeader>
-                <div className="flex items-center gap-2">
-                  <Key className="h-5 w-5 text-primary" />
-                  <CardTitle>{provider.name} API Key</CardTitle>
-                  {existing && (
-                    <Badge variant="outline" className="ml-auto text-xs">
-                      {provider.models}
-                    </Badge>
-                  )}
-                </div>
-                <CardDescription>{provider.description}</CardDescription>
-              </CardHeader>
-              <CardContent className="space-y-4">
-                {/* Current key status */}
-                {existing && (
-                  <div className="flex items-center justify-between p-3 rounded-md border">
-                    <div className="flex items-center gap-3">
-                      <span className="text-sm font-mono text-muted-foreground">
-                        {existing.maskedKey}
-                      </span>
-                      {existing.isValid === 1 ? (
-                        <Badge
-                          variant="outline"
-                          className="bg-emerald-500/10 text-emerald-500 border-emerald-500/20"
-                        >
-                          <CheckCircle2 className="h-3 w-3 mr-1" />
-                          Valid
-                        </Badge>
-                      ) : existing.isValid === 0 &&
-                        existing.lastValidated ? (
-                        <Badge
-                          variant="outline"
-                          className="bg-red-500/10 text-red-500 border-red-500/20"
-                        >
-                          <XCircle className="h-3 w-3 mr-1" />
-                          Invalid
-                        </Badge>
-                      ) : (
-                        <Badge variant="outline">Not validated</Badge>
-                      )}
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        onClick={() => handleValidate(provider.id)}
-                        disabled={isValidating}
-                      >
-                        {isValidating && (
-                          <Loader2 className="h-3 w-3 mr-1 animate-spin" />
-                        )}
-                        Test
-                      </Button>
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        onClick={() => handleDelete(provider.id)}
-                        className="text-destructive hover:text-destructive"
-                      >
-                        <Trash2 className="h-3 w-3" />
-                      </Button>
-                    </div>
-                  </div>
-                )}
-
-                <Separator />
-
-                {/* Save new key */}
-                <div className="space-y-3">
-                  <Label>
-                    {existing
-                      ? `Replace ${provider.name} key`
-                      : `Enter your ${provider.name} API key`}
-                  </Label>
-                  <div className="flex gap-2">
-                    <Input
-                      type="password"
-                      placeholder={provider.placeholder}
-                      value={keyValue}
-                      onChange={(e) =>
-                        setNewKeys((prev) => ({
-                          ...prev,
-                          [provider.id]: e.target.value,
-                        }))
-                      }
-                      autoComplete="off"
-                    />
-                    <Button
-                      onClick={() => handleSave(provider.id)}
-                      disabled={!keyValue.trim() || isSaving}
-                    >
-                      {isSaving && (
-                        <Loader2 className="h-4 w-4 mr-2 animate-spin" />
-                      )}
-                      Save
-                    </Button>
-                  </div>
-                  <p className="text-xs text-muted-foreground">
-                    Get your key from{" "}
-                    <a
-                      href={provider.url}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="text-primary hover:underline inline-flex items-center gap-1"
-                    >
-                      {provider.urlLabel}
-                      <ExternalLink className="h-3 w-3" />
-                    </a>
-                  </p>
-                </div>
-              </CardContent>
-            </Card>
-          );
-        })}
+      <div className="flex flex-col gap-5">
+        {PROVIDERS.map((provider) => (
+          <ProviderCard
+            key={provider.id}
+            provider={provider}
+            existing={getKeyForProvider(provider.id)}
+            newKey={newKeys[provider.id]}
+            onNewKeyChange={(v) => setNewKeys((prev) => ({ ...prev, [provider.id]: v }))}
+            onSave={() => handleSave(provider.id)}
+            onValidate={() => handleValidate(provider.id)}
+            onDelete={() => handleDelete(provider.id)}
+            isSaving={savingProvider === provider.id}
+            isValidating={validatingProvider === provider.id}
+          />
+        ))}
       </div>
     </div>
+  );
+}
+
+interface ProviderCardProps {
+  provider: ProviderDef;
+  existing: { isValid: number | null; lastValidated: string | Date | null; maskedKey: string } | null;
+  newKey: string;
+  onNewKeyChange: (v: string) => void;
+  onSave: () => void;
+  onValidate: () => void;
+  onDelete: () => void;
+  isSaving: boolean;
+  isValidating: boolean;
+}
+
+function ProviderCard({
+  provider,
+  existing,
+  newKey,
+  onNewKeyChange,
+  onSave,
+  onValidate,
+  onDelete,
+  isSaving,
+  isValidating,
+}: ProviderCardProps) {
+  const hasKey = existing !== null;
+  return (
+    <section
+      className={cn(
+        "flex flex-col lg:flex-row gap-5 lg:gap-8 p-5 lg:p-7 border border-border",
+        hasKey ? "bg-card" : "bg-transparent"
+      )}
+    >
+      <div className="w-full lg:w-[260px] shrink-0 flex flex-col gap-1.5">
+        <span className="tag">
+          {provider.number} · {provider.tag}
+        </span>
+        <h2 className="font-heading text-[24px] tracking-[-0.015em] leading-tight">
+          {provider.name}
+        </h2>
+        <p className="text-[13px] text-muted-foreground leading-[1.45]">{provider.description}</p>
+        <a
+          href={provider.url}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="mt-2 tag hover:text-foreground transition-colors self-start"
+        >
+          Get key · {provider.urlLabel} →
+        </a>
+      </div>
+
+      <div className="flex-1 flex flex-col gap-3">
+        {hasKey ? (
+          <>
+            <div className="flex items-center justify-between gap-3 px-4 py-3.5 border border-border bg-background">
+              <span className="font-mono text-[13px] truncate">{existing.maskedKey}</span>
+              <StatusPill valid={existing.isValid} lastValidated={existing.lastValidated} />
+            </div>
+            <div className="flex items-center gap-2.5">
+              <button
+                type="button"
+                onClick={onValidate}
+                disabled={isValidating}
+                className="px-4 py-2.5 text-[13px] font-medium border border-foreground hover:bg-foreground hover:text-foreground-inverse transition-colors disabled:opacity-50"
+              >
+                {isValidating ? "Testing…" : "Test"}
+              </button>
+              <ReplaceInline
+                placeholder={provider.placeholder}
+                value={newKey}
+                onChange={onNewKeyChange}
+                onSubmit={onSave}
+                saving={isSaving}
+                label="Replace"
+              />
+              <button
+                type="button"
+                onClick={onDelete}
+                className="px-4 py-2.5 text-[13px] text-accent hover:text-accent/80 transition-colors"
+              >
+                Delete
+              </button>
+            </div>
+          </>
+        ) : (
+          <>
+            <div className="flex items-center justify-between gap-3 px-4 py-3.5 border border-border bg-background">
+              <span className="font-mono text-[13px] text-muted-foreground italic">
+                {provider.placeholder}
+              </span>
+              <span className="tag">Not set</span>
+            </div>
+            <div className="flex items-center gap-2.5">
+              <input
+                type="password"
+                placeholder={provider.placeholder}
+                value={newKey}
+                onChange={(e) => onNewKeyChange(e.target.value)}
+                autoComplete="off"
+                className="flex-1 px-4 py-2.5 text-[13px] font-mono border border-border bg-background placeholder:text-muted-foreground/70 placeholder:italic focus:border-foreground focus:outline-none"
+              />
+              <button
+                type="button"
+                onClick={onSave}
+                disabled={!newKey.trim() || isSaving}
+                className="px-5 py-2.5 text-[13px] font-medium bg-foreground text-foreground-inverse hover:bg-foreground/90 transition-colors disabled:opacity-40"
+              >
+                {isSaving ? "Saving…" : "Add key"}
+              </button>
+            </div>
+          </>
+        )}
+      </div>
+    </section>
+  );
+}
+
+function ReplaceInline({
+  placeholder,
+  value,
+  onChange,
+  onSubmit,
+  saving,
+  label,
+}: {
+  placeholder: string;
+  value: string;
+  onChange: (v: string) => void;
+  onSubmit: () => void;
+  saving: boolean;
+  label: string;
+}) {
+  const [open, setOpen] = useState(false);
+  if (!open) {
+    return (
+      <button
+        type="button"
+        onClick={() => setOpen(true)}
+        className="px-4 py-2.5 text-[13px] hover:bg-muted transition-colors"
+      >
+        {label}
+      </button>
+    );
+  }
+  return (
+    <div className="flex items-center gap-2 flex-1">
+      <input
+        type="password"
+        placeholder={placeholder}
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        autoComplete="off"
+        autoFocus
+        className="flex-1 px-3 py-2 text-[13px] font-mono border border-border bg-background placeholder:text-muted-foreground/70 placeholder:italic focus:border-foreground focus:outline-none"
+      />
+      <button
+        type="button"
+        onClick={() => {
+          onSubmit();
+          if (value.trim()) setOpen(false);
+        }}
+        disabled={!value.trim() || saving}
+        className="px-4 py-2 text-[13px] font-medium bg-foreground text-foreground-inverse hover:bg-foreground/90 transition-colors disabled:opacity-40"
+      >
+        {saving ? "…" : "Save"}
+      </button>
+      <button
+        type="button"
+        onClick={() => {
+          onChange("");
+          setOpen(false);
+        }}
+        className="px-3 py-2 text-[13px] text-muted-foreground hover:text-foreground transition-colors"
+      >
+        Cancel
+      </button>
+    </div>
+  );
+}
+
+function StatusPill({
+  valid,
+  lastValidated,
+}: {
+  valid: number | null;
+  lastValidated: string | Date | null;
+}) {
+  if (valid === 1) {
+    return (
+      <span className="inline-flex items-center px-2.5 py-1 border border-foreground tag !text-foreground">
+        Valid
+      </span>
+    );
+  }
+  if (valid === 0 && lastValidated) {
+    return (
+      <span className="inline-flex items-center px-2.5 py-1 border border-accent tag !text-accent">
+        Invalid
+      </span>
+    );
+  }
+  return (
+    <span className="inline-flex items-center px-2.5 py-1 border border-border tag">Untested</span>
   );
 }

@@ -10,6 +10,7 @@ import { runPass1, runPass2, runSelfReview } from "@/lib/ai/analyze";
 import type { AnalysisInput } from "@/lib/ai/analyze";
 import { estimateTranscriptionCost, calculateActualCost } from "@/lib/ai/cost";
 import { emitProgress } from "@/lib/queue/progress";
+import { withStageProgress } from "@/lib/queue/stage-progress";
 import type { EditDecisionList } from "@/types/edl";
 
 interface AnalyzeJobData {
@@ -61,12 +62,23 @@ export async function runAnalyzeJob(data: AnalyzeJobData): Promise<EditDecisionL
     .set({ status: "analyzing", prompt, updatedAt: new Date() })
     .where(eq(projects.id, projectId));
 
+  // Roughly: audio extraction = 2s/min of video, transcription = 10s/min of
+  // video, GPT passes = 8-20s, frame extraction = 1.5s/frame. These are just
+  // ticker estimates — the real work finishes when it finishes.
+  const videoDurationSec = project.sourceVideoDuration ?? 60;
+  const estAudioMs = Math.max(2_000, videoDurationSec * 200);
+  const estTranscribeMs = Math.max(6_000, videoDurationSec * 1_400);
+  const estPass1Ms = 12_000;
+  const estPass2Ms = 18_000;
+  const estReviewMs = 10_000;
+  const estFramesMs = 12_000;
+
   // ── 3. Extract audio ──
 
-  emitProgress(projectId, { stage: "extracting_audio", progress: 0 });
   const audioPath = join(projectDir, "audio.wav");
-  await extractAudio(sourcePath, audioPath);
-  emitProgress(projectId, { stage: "extracting_audio", progress: 100 });
+  await withStageProgress(projectId, "extracting_audio", estAudioMs, {}, () =>
+    extractAudio(sourcePath, audioPath)
+  );
 
   // ── 4. Detect silence ──
 
@@ -76,12 +88,16 @@ export async function runAnalyzeJob(data: AnalyzeJobData): Promise<EditDecisionL
   // ── 5. Transcribe ──
 
   const hybridEnabled = process.env.ENABLE_HYBRID_TRANSCRIPTION === "true";
-  emitProgress(projectId, { stage: "transcribing", progress: 0 });
   if (hybridEnabled) {
     console.log(`[analyze] Hybrid transcription enabled`);
   }
-  const transcript = await transcribeAudio(audioPath, apiKey);
-  emitProgress(projectId, { stage: "transcribing", progress: 100 });
+  const transcript = await withStageProgress(
+    projectId,
+    "transcribing",
+    estTranscribeMs,
+    {},
+    () => transcribeAudio(audioPath, apiKey)
+  );
 
   console.log(`[analyze] Transcript: ${transcript.words.length} words, ${transcript.segments.length} segments`);
 
@@ -98,8 +114,10 @@ export async function runAnalyzeJob(data: AnalyzeJobData): Promise<EditDecisionL
   console.log(`[analyze] Detected ${fillerWords.length} filler words`);
 
   // ── 7. Pass 1: Transcript analysis (text-only, no images) ──
-
-  emitProgress(projectId, { stage: "transcript_analysis", progress: 0 });
+  // Run Pass 1 IN PARALLEL with a speculative transcript-aware frame extraction.
+  // Pass 1 hits OpenAI (~8-15s) and frame extraction is CPU-bound (~1.5s/frame).
+  // If Pass 1 comes back with better timestamps, we extract those too; most of
+  // the time the heuristic picks are fine and we save ~15-20s per analysis.
 
   const analysisInput: AnalysisInput = {
     transcript,
@@ -115,38 +133,93 @@ export async function runAnalyzeJob(data: AnalyzeJobData): Promise<EditDecisionL
     apiKey,
   };
 
-  const { result: pass1, tokens: pass1Tokens } = await runPass1(analysisInput);
-
-  emitProgress(projectId, { stage: "transcript_analysis", progress: 100 });
-
-  // ── 8. Targeted frame extraction ──
-  // Use Pass 1 timestamps if available, otherwise fall back to transcript-aware heuristics
-
-  let timestamps = pass1.keyFrameTimestamps;
   const videoDuration = project.sourceVideoDuration ?? 0;
+  const speculativeTimestamps = selectTranscriptAwareTimestamps(
+    transcript,
+    silences,
+    fillerWords,
+    videoDuration
+  ).slice(0, 15);
 
-  if (timestamps.length < 3) {
-    console.log(`[analyze] Pass 1 returned ${timestamps.length} timestamps, falling back to transcript-aware selection`);
-    timestamps = selectTranscriptAwareTimestamps(
-      transcript,
-      silences,
-      fillerWords,
-      videoDuration
-    );
-  } else {
-    console.log(`[analyze] Using ${timestamps.length} timestamps from Pass 1`);
-  }
-
-  // Cap at 15 frames
-  timestamps = timestamps.slice(0, 15);
-  console.log(`[analyze] Extracting ${timestamps.length} frames at: ${timestamps.map(t => t.toFixed(1) + "s").join(", ")}`);
-
-  emitProgress(projectId, { stage: "extracting_frames", progress: 0, frameCount: 0 });
+  console.log(
+    `[analyze] Speculative frame timestamps (${speculativeTimestamps.length}): ${speculativeTimestamps.map((t) => t.toFixed(1) + "s").join(", ")}`
+  );
 
   const framesDir = join(projectDir, "frames");
   await mkdir(framesDir, { recursive: true });
-  const frames = await extractFramesAtTimestamps(sourcePath, framesDir, timestamps, transcript);
 
+  // Kick off frame extraction + Pass 1 concurrently
+  const framesPromise = withStageProgress(
+    projectId,
+    "extracting_frames",
+    Math.max(estFramesMs, speculativeTimestamps.length * 1_500),
+    { frameCount: speculativeTimestamps.length },
+    () => extractFramesAtTimestamps(sourcePath, framesDir, speculativeTimestamps, transcript)
+  );
+
+  const pass1Promise = withStageProgress(
+    projectId,
+    "transcript_analysis",
+    estPass1Ms,
+    {},
+    () => runPass1(analysisInput)
+  );
+
+  const [framesFromSpeculative, pass1Result] = await Promise.all([
+    framesPromise,
+    pass1Promise,
+  ]);
+  const { result: pass1, tokens: pass1Tokens } = pass1Result;
+
+  // ── 8. Reconcile frame selection ──
+  // If Pass 1 produced meaningfully different timestamps, re-extract the missing
+  // ones. Otherwise reuse the speculative set we already have on disk.
+  let timestamps = pass1.keyFrameTimestamps.slice(0, 15);
+  let frames = framesFromSpeculative;
+
+  if (timestamps.length >= 3) {
+    // Figure out which Pass 1 picks are NOT already in the speculative set
+    const EPS = 0.5; // seconds — consider timestamps within 0.5s as equivalent
+    const missing = timestamps.filter(
+      (t) => !speculativeTimestamps.some((s) => Math.abs(s - t) < EPS)
+    );
+
+    if (missing.length === 0) {
+      console.log(
+        `[analyze] Pass 1 timestamps match speculative set — no extra extraction`
+      );
+    } else {
+      console.log(
+        `[analyze] Pass 1 requested ${missing.length} additional frames: ${missing.map((t) => t.toFixed(1) + "s").join(", ")}`
+      );
+      const extraFrames = await extractFramesAtTimestamps(
+        sourcePath,
+        framesDir,
+        missing,
+        transcript
+      );
+      // Merge + dedupe by timestamp
+      const merged = [...framesFromSpeculative, ...extraFrames];
+      const seen = new Set<number>();
+      frames = merged.filter((f) => {
+        const key = Math.round(f.timestamp * 10);
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+    }
+  } else {
+    console.log(
+      `[analyze] Pass 1 returned only ${timestamps.length} timestamps, keeping speculative set`
+    );
+    timestamps = speculativeTimestamps;
+  }
+
+  console.log(`[analyze] Final frame count: ${frames.length}`);
+
+  // Emit a final "extracting_frames" progress event so the UI ticks the stage
+  // to done. The actual extraction already happened concurrently with Pass 1
+  // via the framesPromise above — no duplicate work here.
   emitProgress(projectId, {
     stage: "extracting_frames",
     progress: 100,
@@ -157,36 +230,30 @@ export async function runAnalyzeJob(data: AnalyzeJobData): Promise<EditDecisionL
 
   const transcriptionCost = estimateTranscriptionCost(project.sourceVideoDuration ?? 0);
 
-  emitProgress(projectId, {
-    stage: "visual_analysis",
-    progress: 0,
-    estimatedCost: `Pass 1: ${pass1Tokens} tokens. Transcription: ${transcriptionCost.display}. Pass 2 running...`,
-  });
-
-  const { edl: rawEdl, tokens: pass2Tokens } = await runPass2(
-    analysisInput,
-    pass1,
-    frames
+  const { edl: rawEdl, tokens: pass2Tokens } = await withStageProgress(
+    projectId,
+    "visual_analysis",
+    estPass2Ms,
+    {
+      estimatedCost: `Pass 1: ${pass1Tokens} tokens. Transcription: ${transcriptionCost.display}. Pass 2 running...`,
+    },
+    () => runPass2(analysisInput, pass1, frames)
   );
 
-  emitProgress(projectId, {
-    stage: "visual_analysis",
-    progress: 100,
-    estimatedCost: "",
-  });
-
   // ── 10. Self-review ──
-
-  emitProgress(projectId, { stage: "edl_review", progress: 0 });
 
   const {
     edl: reviewedEdl,
     confidence,
     issues,
     tokens: reviewTokens,
-  } = await runSelfReview(rawEdl, transcript, apiKey);
-
-  emitProgress(projectId, { stage: "edl_review", progress: 100 });
+  } = await withStageProgress(
+    projectId,
+    "edl_review",
+    estReviewMs,
+    {},
+    () => runSelfReview(rawEdl, transcript, apiKey)
+  );
 
   console.log(`[analyze] Review confidence: ${confidence}, issues: ${issues.length}`);
   console.log(`[analyze] Tokens: pass1=${pass1Tokens}, pass2=${pass2Tokens}, review=${reviewTokens}, total=${pass1Tokens + pass2Tokens + reviewTokens}`);

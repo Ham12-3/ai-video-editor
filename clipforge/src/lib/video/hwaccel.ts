@@ -8,8 +8,8 @@ export interface EncoderConfig {
 
 const SOFTWARE_ENCODER: EncoderConfig = {
   videoCodec: "libx264",
-  codecArgs: ["-preset", "fast", "-crf", "23"],
-  label: "libx264 (software, fast preset)",
+  codecArgs: ["-preset", "veryfast", "-crf", "23"],
+  label: "libx264 (software, veryfast preset)",
 };
 
 const HW_ENCODERS: Array<{

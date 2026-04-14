@@ -1,8 +1,6 @@
 "use client";
 
 import { useEffect } from "react";
-import { Button } from "@/components/ui/button";
-import { AlertTriangle } from "lucide-react";
 
 export default function ErrorBoundary({
   error,
@@ -16,18 +14,35 @@ export default function ErrorBoundary({
   }, [error]);
 
   return (
-    <div className="flex flex-col items-center justify-center min-h-screen gap-4 p-6 text-center">
-      <div className="rounded-full bg-destructive/10 p-4">
-        <AlertTriangle className="h-8 w-8 text-destructive" />
-      </div>
-      <h2 className="text-xl font-semibold">Something went wrong</h2>
-      <p className="text-sm text-muted-foreground max-w-md">
-        An unexpected error occurred. Please try again. If the problem persists,
-        try refreshing the page.
+    <div className="flex flex-col items-start justify-center min-h-screen gap-6 px-12 py-16 max-w-[640px]">
+      <span className="tag !text-accent">Something broke</span>
+      <h2 className="font-heading text-[56px] tracking-[-0.032em] leading-[0.95]">
+        This one&rsquo;s on us.
+      </h2>
+      <p className="text-base text-muted-foreground leading-[1.55]">
+        The app hit an unexpected error. Try again, and if this keeps happening tell us what
+        you were doing so we can fix it.
       </p>
-      <Button onClick={reset} variant="outline">
-        Try again
-      </Button>
+      {error.digest && (
+        <span className="font-mono text-[11px] text-muted-foreground tracking-wide">
+          Error ref · {error.digest}
+        </span>
+      )}
+      <div className="flex items-center gap-2.5 pt-2">
+        <button
+          type="button"
+          onClick={reset}
+          className="inline-flex items-center gap-2 bg-foreground text-foreground-inverse px-5 py-3 text-sm font-medium hover:bg-foreground/90 transition-colors"
+        >
+          Try again <span aria-hidden>→</span>
+        </button>
+        <a
+          href="/projects"
+          className="inline-flex items-center px-5 py-3 text-sm hover:bg-muted transition-colors"
+        >
+          Back to projects
+        </a>
+      </div>
     </div>
   );
 }
